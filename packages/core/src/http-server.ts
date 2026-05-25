@@ -275,16 +275,20 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   app.get('/poll', (req, res) => {
     const instanceId = req.query.instanceId as string | undefined;
 
-    if (instanceId) {
-      bridge.updateInstanceActivity(instanceId);
-    }
-
     let callerRole = 'edit';
     if (instanceId) {
-      const inst = bridge.getInstances().find(i => i.instanceId === instanceId);
+      let inst = bridge.getInstances().find(i => i.instanceId === instanceId);
+      // Auto-register if the plugin polls with an unknown instanceId.
+      // Happens when the plugin's /ready POST landed on a primary that since died,
+      // or when the plugin reconnects to a fresh server without re-firing /ready.
+      if (!inst) {
+        bridge.registerInstance(instanceId, 'edit');
+        inst = bridge.getInstances().find(i => i.instanceId === instanceId);
+      }
       if (inst) {
         callerRole = inst.role;
       }
+      bridge.updateInstanceActivity(instanceId);
     }
 
     if (!isMCPServerActive()) {
