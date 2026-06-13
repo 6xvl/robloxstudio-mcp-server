@@ -236,9 +236,9 @@ export class RobloxStudioMCPServer {
       const hookConnectTimeoutMs = parseInt(process.env.ROBLOX_MCP_HOOK_TIMEOUT_MS || '5000');
       const hookConnect = this.robloxHook.connect();
       await Promise.race([
-        hookConnect.catch(err => {
-          console.error(`[roblox-hook] connect failed (non-fatal): ${err.message}`);
-        }),
+        // The client logs its own clear, calm message on failure (see RobloxOfficialMCPClient.connect).
+        // Swallow the rejection here so the optional hook never bubbles a second alarming line.
+        hookConnect.catch(() => {}),
         new Promise(resolve => setTimeout(resolve, hookConnectTimeoutMs)),
       ]);
       // If it's still pending, attach a deferred handler so catalog updates when it finally connects

@@ -159,6 +159,6 @@ Running several Studios at once? Give each its own port (`--port 58741`, `--port
 
 ---
 
-<!-- VERSION_LINE -->**v3.0.0** — 96+ tools, multi-Studio routing, Roblox MCP hook, Blender-parity hang controls
+<!-- VERSION_LINE -->**v3.0.4** — 96+ tools, multi-Studio routing, Roblox MCP hook, Blender-parity hang controls
 
 [Report Issues](https://github.com/6xvl/robloxstudio-mcp-server/issues) | MIT Licensed

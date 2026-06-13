@@ -69,7 +69,16 @@ export class RobloxOfficialMCPClient {
         this.connected = true;
         console.error(`[roblox-hook] Connected to Roblox StudioMCP — ${this.toolsCache.length} tools`);
       } catch (err) {
-        console.error(`[roblox-hook] Failed to connect to Roblox StudioMCP: ${(err as Error).message}`);
+        // An unavailable official MCP is an EXPECTED optional state, not a fault: -32000 /
+        // "Connection closed" / ECONNREFUSED / ENOENT all just mean Roblox Studio (or its built-in
+        // MCP) isn't running right now. Report it as one calm line so it doesn't read like the whole
+        // server failed to start. Keep the raw detail only for genuinely unexpected errors.
+        const msg = (err as Error).message || String(err);
+        if (/-32000|connection closed|ECONNREFUSED|ENOENT|EPIPE/i.test(msg)) {
+          console.error('[roblox-hook] Roblox official StudioMCP not running — continuing without its tools (optional). Open Studio with its built-in MCP enabled to include them, or set ROBLOX_MCP_HOOK=0 to skip this check.');
+        } else {
+          console.error(`[roblox-hook] Roblox official StudioMCP unavailable (optional, non-fatal): ${msg}`);
+        }
         this.connected = false;
         this.client = null;
         this.transport = null;
