@@ -4,6 +4,7 @@ import { readFileSync, readdirSync, writeFileSync, copyFileSync, existsSync, mkd
 import { fileURLToPath } from 'url';
 import { dirname, join, basename } from 'path';
 import { homedir } from 'os';
+import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, '..');
@@ -59,9 +60,24 @@ function injectVersion(source) {
 
 const serverInitPath = join(serverDir, 'init.server.luau');
 if (!existsSync(serverInitPath)) {
-  console.error(`Server script not found at ${serverInitPath}`);
-  console.error('Run "cd studio-plugin && npm run build" first to compile TypeScript.');
-  process.exit(1);
+  // Auto-compile the plugin TypeScript (rbxtsc) instead of hard-failing, so `build:plugin`
+  // — and therefore `publish:all` — works in one shot without a manual pre-step.
+  console.log('Compiled plugin output missing — building studio-plugin (rbxtsc)...');
+  try {
+    if (!existsSync(join(pluginDir, 'node_modules'))) {
+      console.log('  installing studio-plugin dependencies...');
+      execSync('npm install', { cwd: pluginDir, stdio: 'inherit' });
+    }
+    execSync('npm run build', { cwd: pluginDir, stdio: 'inherit' });
+  } catch (err) {
+    console.error(`Failed to auto-build studio-plugin: ${err.message}`);
+    console.error('Compile it manually with "cd studio-plugin && npm run build", then re-run.');
+    process.exit(1);
+  }
+  if (!existsSync(serverInitPath)) {
+    console.error(`Server script still not found at ${serverInitPath} after building studio-plugin.`);
+    process.exit(1);
+  }
 }
 
 const mainSource = injectVersion(readFileSync(serverInitPath, 'utf8'));
