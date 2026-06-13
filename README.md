@@ -35,6 +35,13 @@ gemini mcp add robloxstudio npx --trust -- -y @6xvl/robloxstudio-mcp@latest
 
 Plugin shows "Connected" when ready.
 
+> **Seeing `failed to connect to roblox studio: -32000` (or `[roblox-hook] ... Connection closed`)?**
+> This is **harmless** and does **not** mean the server failed. It's the optional Roblox *official* `StudioMCP.exe` hook, which auto-enables when `%LOCALAPPDATA%\Roblox\mcp.bat` exists and errors out if Roblox Studio isn't running with its built-in MCP enabled. The line is logged `(non-fatal)` and the server keeps running normally. To silence it, disable the hook:
+> ```bash
+> claude mcp add robloxstudio -e ROBLOX_MCP_HOOK=0 -- npx -y @6xvl/robloxstudio-mcp@latest
+> ```
+> Or open Roblox Studio first and the hook connects instead of erroring.
+
 <details>
 <summary>Other MCP clients (Claude Desktop, Cursor, etc.)</summary>
 
@@ -112,6 +119,42 @@ gemini mcp add robloxstudio-inspector npx --trust -- -y @6xvl/robloxstudio-mcp-i
 ```
 </details>
 
+</details>
+
+---
+
+## Troubleshooting
+
+<details>
+<summary><code>failed to connect to roblox studio: -32000</code> / <code>[roblox-hook] ... Connection closed</code></summary>
+
+**Harmless — the server still works.** This is the optional Roblox *official* `StudioMCP.exe` hook, not the MCP server itself. It auto-enables when `%LOCALAPPDATA%\Roblox\mcp.bat` is present and reports `-32000: Connection closed` when Studio isn't running with its built-in MCP. The error is logged `(non-fatal)`; the server continues on stdio. Disable the hook to remove the message:
+
+```bash
+claude mcp add robloxstudio -e ROBLOX_MCP_HOOK=0 -- npx -y @6xvl/robloxstudio-mcp@latest
+```
+
+Set `ROBLOX_MCP_HOOK=1` to *force* the hook on, or `0` to force it off (default: auto).
+</details>
+
+<details>
+<summary>Server says "Waiting for Studio plugin to connect..." forever</summary>
+
+The Studio plugin connects to **one** HTTP port (default `58741`). If that port is already taken by another MCP instance, this server auto-shifts to the next free port (`58742`, `58743`, ...) — and the plugin never finds it. Pin the port explicitly so it matches the plugin:
+
+```bash
+claude mcp add robloxstudio -- npx -y @6xvl/robloxstudio-mcp@latest --port 58741
+```
+
+Running several Studios at once? Give each its own port (`--port 58741`, `--port 58742`) and one MCP entry per port. Remove any duplicate entries pointing at the same port first (`claude mcp remove <name>`).
+</details>
+
+<details>
+<summary>Plugin never shows "Connected"</summary>
+
+- Make sure **Allow HTTP Requests** is enabled (Game Settings → Security).
+- Confirm the plugin and the server target the same port (see above).
+- On Windows, if `npx` misbehaves, use the `cmd /c npx ...` form shown above.
 </details>
 
 ---
