@@ -11,12 +11,15 @@ local State = TS.import(script, script, "modules", "State")
 local UI = TS.import(script, script, "modules", "UI")
 local Communication = TS.import(script, script, "modules", "Communication")
 local RuntimeLogBuffer = TS.import(script, script, "modules", "RuntimeLogBuffer")
+local BreakpointHandlers = TS.import(script, script, "modules", "handlers", "BreakpointHandlers")
 local _EvalBridges = TS.import(script, script, "modules", "EvalBridges")
 local cleanupLegacyEditBridges = _EvalBridges.cleanupLegacyEditBridges
 local ensureRuntimeBridgeInstalled = _EvalBridges.ensureRuntimeBridgeInstalled
 -- Attach the per-peer LogService listener before anything else, so boot-time prints from
 -- the place's own scripts are captured rather than missed. Idempotent.
 RuntimeLogBuffer.install()
+-- Breakpoints are stored through plugin:SetSetting, so the module needs the handle.
+BreakpointHandlers.init(plugin)
 UI.init(plugin)
 local elements = UI.getElements()
 -- WHICH DATAMODEL THIS COPY OF THE PLUGIN IS IN. A playtest forks the DataModel, and the
@@ -173,6 +176,12 @@ local LogHandlers = TS.import(script, script.Parent, "handlers", "LogHandlers")
 local SelectionHandlers = TS.import(script, script.Parent, "handlers", "SelectionHandlers")
 local SerializationHandlers = TS.import(script, script.Parent, "handlers", "SerializationHandlers")
 local GenerateModelHandlers = TS.import(script, script.Parent, "handlers", "GenerateModelHandlers")
+local ScriptProfilerHandlers = TS.import(script, script.Parent, "handlers", "ScriptProfilerHandlers")
+local MicroProfilerHandlers = TS.import(script, script.Parent, "handlers", "MicroProfilerHandlers")
+local MemoryHandlers = TS.import(script, script.Parent, "handlers", "MemoryHandlers")
+local SceneAnalysisHandlers = TS.import(script, script.Parent, "handlers", "SceneAnalysisHandlers")
+local BreakpointHandlers = TS.import(script, script.Parent, "handlers", "BreakpointHandlers")
+local MultiplayerTestHandlers = TS.import(script, script.Parent, "handlers", "MultiplayerTestHandlers")
 local instanceId = HttpService:GenerateGUID(false)
 local assignedRole
 local function detectRole()
@@ -231,6 +240,16 @@ local routeMap = {
 	["/api/export-rbxm"] = SerializationHandlers.exportRbxm,
 	["/api/import-rbxm"] = SerializationHandlers.importRbxm,
 	["/api/generate-model"] = GenerateModelHandlers.generateModel,
+	["/api/capture-script-profiler"] = ScriptProfilerHandlers.captureScriptProfiler,
+	["/api/capture-micro-profiler"] = MicroProfilerHandlers.captureMicroProfiler,
+	["/api/get-memory-breakdown"] = MemoryHandlers.getMemoryBreakdown,
+	["/api/get-scene-analysis"] = SceneAnalysisHandlers.getSceneAnalysis,
+	["/api/breakpoints"] = BreakpointHandlers.breakpoints,
+	["/api/multiplayer-test-start"] = MultiplayerTestHandlers.multiplayerTestStart,
+	["/api/multiplayer-test-state"] = MultiplayerTestHandlers.multiplayerTestState,
+	["/api/multiplayer-test-add-players"] = MultiplayerTestHandlers.multiplayerTestAddPlayers,
+	["/api/multiplayer-test-leave-client"] = MultiplayerTestHandlers.multiplayerTestLeaveClient,
+	["/api/multiplayer-test-end"] = MultiplayerTestHandlers.multiplayerTestEnd,
 	["/api/undo"] = MetadataHandlers.undo,
 	["/api/redo"] = MetadataHandlers.redo,
 	["/api/bulk-set-attributes"] = MetadataHandlers.bulkSetAttributes,
@@ -1166,6 +1185,524 @@ return {
         </Item>
         <Item class="ModuleScript" referent="6">
           <Properties>
+            <string name="Name">BreakpointHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local Utils = TS.import(script, script.Parent.Parent, "Utils")
+local _binding = Utils
+local getInstanceByPath = _binding.getInstanceByPath
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
+local LOG_PREFIX = "Breakpoint"
+local REGISTRY_KEY_PREFIX = "MCP_BREAKPOINTS_V1_"
+local MCP_PLACE_ID_ATTRIBUTE = "__MCPPlaceId"
+local pluginRef
+local loadedRegistryKey
+local loadedRegistryFromSettings = false
+local breakpoints = {}
+local function init(p)
+	pluginRef = p
+end
+local function breakpointKey(scriptPath, line)
+	return `{scriptPath}:{line}`
+end
+local function computeInstanceId()
+	if game.PlaceId ~= 0 then
+		return `place:{tostring(game.PlaceId)}`
+	end
+	local existing = ServerStorage:GetAttribute(MCP_PLACE_ID_ATTRIBUTE)
+	if type(existing) == "string" and existing ~= "" then
+		return `anon:{existing}`
+	end
+	local fresh = HttpService:GenerateGUID(false)
+	pcall(function()
+		return ServerStorage:SetAttribute(MCP_PLACE_ID_ATTRIBUTE, fresh)
+	end)
+	return `anon:{fresh}`
+end
+local function detectRole()
+	if not RunService:IsRunning() then
+		return "edit"
+	end
+	if RunService:IsServer() then
+		return "server"
+	end
+	return "client"
+end
+local function requestedRole(requestData)
+	local ___mcp_target_role = requestData.__mcp_target_role
+	local _condition = type(___mcp_target_role) == "string"
+	if _condition then
+		_condition = requestData.__mcp_target_role ~= ""
+	end
+	return if _condition then requestData.__mcp_target_role else detectRole()
+end
+local function registryScope(requestData)
+	local ___mcp_instance_id = requestData.__mcp_instance_id
+	local _condition = type(___mcp_instance_id) == "string"
+	if _condition then
+		_condition = requestData.__mcp_instance_id ~= ""
+	end
+	local instanceId = if _condition then requestData.__mcp_instance_id else computeInstanceId()
+	local role = requestedRole(requestData)
+	return {
+		key = `{REGISTRY_KEY_PREFIX}{instanceId}:{role}`,
+	}
+end
+local function readSetting(key)
+	if not pluginRef then
+		return nil
+	end
+	local ok, value = pcall(function()
+		return pluginRef:GetSetting(key)
+	end)
+	return if ok then value else nil
+end
+local function writeSetting(key, value)
+	if not pluginRef then
+		return false
+	end
+	local ok = pcall(function()
+		return pluginRef:SetSetting(key, value)
+	end)
+	return ok
+end
+local function decodePersistedBreakpointEntry(value)
+	local _value = value
+	if not (type(_value) == "table") then
+		return nil
+	end
+	local data = value
+	local _script_path = data.script_path
+	local _condition = not (type(_script_path) == "string")
+	if not _condition then
+		_condition = data.script_path == ""
+	end
+	if _condition then
+		return nil
+	end
+	local _line = data.line
+	local _condition_1 = not (type(_line) == "number")
+	if not _condition_1 then
+		_condition_1 = data.line < 1
+	end
+	if _condition_1 then
+		return nil
+	end
+	return {
+		script_path = data.script_path,
+		line = math.floor(data.line),
+	}
+end
+local function loadRegistry(requestData)
+	local scope = registryScope(requestData)
+	if loadedRegistryKey ~= scope.key then
+		table.clear(breakpoints)
+		loadedRegistryKey = scope.key
+		loadedRegistryFromSettings = false
+	end
+	if loadedRegistryFromSettings then
+		return scope
+	end
+	loadedRegistryFromSettings = true
+	local stored = readSetting(scope.key)
+	if stored == nil then
+		return scope
+	end
+	local decoded = stored
+	if type(stored) == "string" then
+		local ok, result = pcall(function()
+			return HttpService:JSONDecode(stored)
+		end)
+		if not ok then
+			return scope
+		end
+		decoded = result
+	end
+	local _decoded = decoded
+	if not (type(_decoded) == "table") then
+		return scope
+	end
+	table.clear(breakpoints)
+	for _, item in decoded do
+		local entry = decodePersistedBreakpointEntry(item)
+		if entry then
+			local _arg0 = breakpointKey(entry.script_path, entry.line)
+			breakpoints[_arg0] = entry
+		end
+	end
+	return scope
+end
+local function persistRegistry(scope)
+	if not pluginRef then
+		return {
+			ok = false,
+			error = "Plugin settings are unavailable; managed breakpoint registry is memory-only.",
+		}
+	end
+	local out = {}
+	for _, entry in breakpoints do
+		local _arg0 = {
+			script_path = entry.script_path,
+			line = entry.line,
+		}
+		table.insert(out, _arg0)
+	end
+	local encodedOk, encoded = pcall(function()
+		return HttpService:JSONEncode(out)
+	end)
+	if not encodedOk or not (type(encoded) == "string") then
+		return {
+			ok = false,
+			error = `Failed to encode managed breakpoint registry: {tostring(encoded)}`,
+		}
+	end
+	if not writeSetting(scope.key, encoded) then
+		return {
+			ok = false,
+			error = "Failed to persist managed breakpoint registry with plugin:SetSetting.",
+		}
+	end
+	local stored = readSetting(scope.key)
+	if stored ~= encoded then
+		return {
+			ok = false,
+			error = "Failed to verify managed breakpoint registry persistence after plugin:SetSetting.",
+		}
+	end
+	return {
+		ok = true,
+	}
+end
+local function attachPersistenceWarning(response, persist)
+	if not persist.ok then
+		response.managed_registry_persisted = false
+		response.registry_error = persist.error
+	end
+	return response
+end
+local function serviceError(message)
+	local _object = {
+		error = "script_debugger_unavailable",
+	}
+	local _left = "message"
+	local _condition = message
+	if _condition == nil then
+		_condition = "ScriptDebuggerService is unavailable. Enable the Studio Debugger Luau API beta feature and restart Studio."
+	end
+	_object[_left] = _condition
+	_object.betaFeatureRequired = true
+	return _object
+end
+local function operationError(errorCode, operation, raw)
+	return {
+		error = errorCode,
+		message = `{operation} failed. The breakpoints tool requires the Studio Debugger Luau API beta feature. ` .. "Enable it in Studio Beta Features and restart/reload Studio, then retry.",
+		rawMessage = tostring(raw),
+		betaFeatureRequired = true,
+	}
+end
+local function getService()
+	local provider = game
+	local ok, service = pcall(function()
+		return provider:GetService("ScriptDebuggerService")
+	end)
+	if not ok or not service then
+		return serviceError(`ScriptDebuggerService unavailable: {tostring(service)}`)
+	end
+	return service
+end
+local function luauStringLiteral(value)
+	local escaped = (string.gsub(value, "\\", "\\\\"))
+	escaped = (string.gsub(escaped, "\n", "\\n"))
+	escaped = (string.gsub(escaped, "\r", "\\r"))
+	escaped = (string.gsub(escaped, "\t", "\\t"))
+	escaped = (string.gsub(escaped, '"', '\\"'))
+	return `"{escaped}"`
+end
+local function buildLogMessage(scriptPath, line, logMessage)
+	local prefix = { luauStringLiteral(LOG_PREFIX), luauStringLiteral(`{scriptPath}:{line}`) }
+	local _logMessage = logMessage
+	local _condition = type(_logMessage) == "string"
+	if _condition then
+		_condition = logMessage ~= ""
+	end
+	if _condition then
+		local _logMessage_1 = logMessage
+		table.insert(prefix, _logMessage_1)
+	end
+	return table.concat(prefix, ", ")
+end
+local function listBreakpoints(requestData)
+	loadRegistry(requestData)
+	local out = {}
+	for _, entry in breakpoints do
+		table.insert(out, entry)
+	end
+	return {
+		breakpoints = out,
+		count = #out,
+	}
+end
+local function setBreakpoint(requestData)
+	local scope = loadRegistry(requestData)
+	local serviceOrError = getService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	local scriptPath = requestData.script_path
+	local lineRaw = requestData.line
+	if not (type(scriptPath) == "string") or scriptPath == "" or not (type(lineRaw) == "number") then
+		return {
+			error = "invalid_args",
+			message = "breakpoints action=set requires script_path and line",
+		}
+	end
+	local requestedLine = math.floor(lineRaw)
+	if requestedLine < 1 then
+		return {
+			error = "invalid_line",
+			message = "line must be a 1-based positive number",
+		}
+	end
+	local instance = getInstanceByPath(scriptPath)
+	if not instance then
+		return {
+			error = "script_not_found",
+			script_path = scriptPath,
+		}
+	end
+	if not instance:IsA("LuaSourceContainer") then
+		return {
+			error = "not_a_script",
+			message = `{scriptPath} is {instance.ClassName}, not a LuaSourceContainer`,
+			script_path = scriptPath,
+		}
+	end
+	local _log_message = requestData.log_message
+	local rawLogMessage = if type(_log_message) == "string" then requestData.log_message else nil
+	local hasLogMessage = rawLogMessage ~= nil and rawLogMessage ~= ""
+	local _continue_execution = requestData.continue_execution
+	local continueExecution = if type(_continue_execution) == "boolean" then requestData.continue_execution else hasLogMessage
+	local _enabled = requestData.enabled
+	local enabled = if type(_enabled) == "boolean" then requestData.enabled else true
+	local effectiveLogMessage = if hasLogMessage or continueExecution then buildLogMessage(scriptPath, requestedLine, rawLogMessage) else nil
+	local spec = {
+		Line = requestedLine,
+		Enabled = enabled,
+		ContinueExecution = continueExecution,
+	}
+	local _condition = requestData.condition
+	local _condition_1 = type(_condition) == "string"
+	if _condition_1 then
+		_condition_1 = requestData.condition ~= ""
+	end
+	if _condition_1 then
+		spec.Condition = requestData.condition
+	end
+	if effectiveLogMessage ~= nil then
+		spec.LogMessage = effectiveLogMessage
+	end
+	local ok, result = pcall(function()
+		return service:AddBreakpoint(instance, spec)
+	end)
+	if not ok then
+		return operationError("add_breakpoint_failed", "ScriptDebuggerService:AddBreakpoint", result)
+	end
+	local breakpointResult = result
+	local _line = breakpointResult.Line
+	local actualLine = if type(_line) == "number" then breakpointResult.Line else requestedLine
+	local _verified = breakpointResult.Verified
+	local verified = if type(_verified) == "boolean" then breakpointResult.Verified else nil
+	local _message = breakpointResult.Message
+	local message = if type(_message) == "string" then breakpointResult.Message else nil
+	local entry = {
+		script_path = scriptPath,
+		line = actualLine,
+		requested_line = if actualLine ~= requestedLine then requestedLine else nil,
+		enabled = enabled,
+		condition = spec.Condition,
+		log_message = rawLogMessage,
+		continue_execution = continueExecution,
+		verified = if verified == false then false else nil,
+		message = message,
+		created_at = DateTime.now().UnixTimestampMillis,
+	}
+	local _arg0 = breakpointKey(scriptPath, actualLine)
+	breakpoints[_arg0] = entry
+	return attachPersistenceWarning({
+		ok = true,
+		breakpoint = entry,
+	}, persistRegistry(scope))
+end
+local function removeBreakpoint(requestData)
+	local scope = loadRegistry(requestData)
+	local serviceOrError = getService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	local scriptPath = requestData.script_path
+	local lineRaw = requestData.line
+	if not (type(scriptPath) == "string") or scriptPath == "" or not (type(lineRaw) == "number") then
+		return {
+			error = "invalid_args",
+			message = "breakpoints action=remove requires script_path and line",
+		}
+	end
+	local line = math.floor(lineRaw)
+	if line < 1 then
+		return {
+			error = "invalid_line",
+			message = "line must be a 1-based positive number",
+		}
+	end
+	local instance = getInstanceByPath(scriptPath)
+	if not instance then
+		return {
+			error = "script_not_found",
+			script_path = scriptPath,
+		}
+	end
+	if not instance:IsA("LuaSourceContainer") then
+		return {
+			error = "not_a_script",
+			message = `{scriptPath} is {instance.ClassName}, not a LuaSourceContainer`,
+			script_path = scriptPath,
+		}
+	end
+	local ok, removed = pcall(function()
+		return service:RemoveBreakpoint(instance, line)
+	end)
+	if not ok then
+		return operationError("remove_breakpoint_failed", "ScriptDebuggerService:RemoveBreakpoint", removed)
+	end
+	local _arg0 = breakpointKey(scriptPath, line)
+	breakpoints[_arg0] = nil
+	return attachPersistenceWarning({
+		ok = true,
+		removed = removed,
+		script_path = scriptPath,
+		line = line,
+	}, persistRegistry(scope))
+end
+local function clearManagedBreakpoints(requestData)
+	local scope = loadRegistry(requestData)
+	local serviceOrError = getService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	local cleared = 0
+	local errors = {}
+	for key, entry in breakpoints do
+		local instance = getInstanceByPath(entry.script_path)
+		if not instance or not instance:IsA("LuaSourceContainer") then
+			breakpoints[key] = nil
+			cleared += 1
+			continue
+		end
+		local ok, removedOrError = pcall(function()
+			return service:RemoveBreakpoint(instance, entry.line)
+		end)
+		if ok then
+			breakpoints[key] = nil
+			cleared += 1
+		else
+			local _arg0 = {
+				script_path = entry.script_path,
+				line = entry.line,
+				error = tostring(removedOrError),
+			}
+			table.insert(errors, _arg0)
+		end
+	end
+	if #errors > 0 then
+		return {
+			ok = false,
+			cleared = cleared,
+			errors = errors,
+		}
+	end
+	return attachPersistenceWarning({
+		ok = true,
+		cleared = cleared,
+	}, persistRegistry(scope))
+end
+local function clearAllBreakpoints(requestData)
+	local scope = loadRegistry(requestData)
+	local serviceOrError = getService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	-- ▼ ReadonlyMap.size ▼
+	local _size = 0
+	for _ in breakpoints do
+		_size += 1
+	end
+	-- ▲ ReadonlyMap.size ▲
+	local managedCount = _size
+	local ok, err = pcall(function()
+		return service:ClearBreakpoints()
+	end)
+	if not ok then
+		return operationError("clear_breakpoints_failed", "ScriptDebuggerService:ClearBreakpoints", err)
+	end
+	table.clear(breakpoints)
+	return attachPersistenceWarning({
+		ok = true,
+		cleared_managed = managedCount,
+	}, persistRegistry(scope))
+end
+local function clearBreakpoints(requestData)
+	if requestData.clear_all == true then
+		return clearAllBreakpoints(requestData)
+	end
+	return clearManagedBreakpoints(requestData)
+end
+local function breakpointsTool(requestData)
+	local action = requestData.action
+	if not (type(action) == "string") or action == "" then
+		return {
+			error = "invalid_args",
+			message = "breakpoints requires action=set|remove|clear|list",
+		}
+	end
+	repeat
+		if action == "set" then
+			return setBreakpoint(requestData)
+		end
+		if action == "remove" then
+			return removeBreakpoint(requestData)
+		end
+		if action == "clear" then
+			return clearBreakpoints(requestData)
+		end
+		if action == "list" then
+			return listBreakpoints(requestData)
+		end
+		return {
+			error = "unknown_action",
+			message = `breakpoints action must be one of: set, remove, clear, list (got {action})`,
+		}
+	until true
+end
+return {
+	breakpoints = breakpointsTool,
+	init = init,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
             <string name="Name">BuildHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
 local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
@@ -1729,7 +2266,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="7">
+        <Item class="ModuleScript" referent="8">
           <Properties>
             <string name="Name">CaptureHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -1895,7 +2432,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="8">
+        <Item class="ModuleScript" referent="9">
           <Properties>
             <string name="Name">EvalRuntimeHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2049,7 +2586,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="9">
+        <Item class="ModuleScript" referent="10">
           <Properties>
             <string name="Name">GenerateModelHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2254,7 +2791,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="11">
           <Properties>
             <string name="Name">InputHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2408,7 +2945,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">InstanceHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2915,7 +3452,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">LogHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2941,7 +3478,75 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="14">
+          <Properties>
+            <string name="Name">MemoryHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local Stats = game:GetService("Stats")
+-- GetMemoryUsageMbAllCategories is gated by capability "InternalTest" and not
+-- callable from plugin context. GetMemoryUsageMbForTag is not - so we iterate
+-- Enum.DeveloperMemoryTag and ask per-tag.
+local function getMemoryBreakdown(requestData)
+	if not Stats.MemoryTrackingEnabled then
+		return {
+			error = "MemoryTrackingEnabled is false on this peer",
+		}
+	end
+	local requested = requestData.tags
+	local _result
+	if requested and #requested > 0 then
+		local _set = {}
+		for _, _v in requested do
+			_set[_v] = true
+		end
+		_result = _set
+	else
+		_result = nil
+	end
+	local requestedSet = _result
+	local categories = {}
+	for _, item in Enum.DeveloperMemoryTag:GetEnumItems() do
+		local name = item.Name
+		if requestedSet and not (requestedSet[name] ~= nil) then
+			continue
+		end
+		local ok, mb = pcall(function()
+			return Stats:GetMemoryUsageMbForTag(item)
+		end)
+		categories[name] = if ok then mb else 0
+	end
+	local unknownTags = {}
+	if requestedSet then
+		local known = {}
+		for _, i in Enum.DeveloperMemoryTag:GetEnumItems() do
+			local _name = i.Name
+			known[_name] = true
+		end
+		for t in requestedSet do
+			if not (known[t] ~= nil) then
+				table.insert(unknownTags, t)
+				categories[t] = 0
+			end
+		end
+	end
+	local result = {
+		total_mb = Stats:GetTotalMemoryUsageMb(),
+		categories = categories,
+		memory_tracking_enabled = true,
+		timestamp = DateTime.now().UnixTimestampMillis,
+	}
+	if #unknownTags > 0 then
+		result.unknown_tags = unknownTags
+	end
+	return result
+end
+return {
+	getMemoryBreakdown = getMemoryBreakdown,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="15">
           <Properties>
             <string name="Name">MetadataHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3524,7 +4129,2025 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="14">
+        <Item class="ModuleScript" referent="16">
+          <Properties>
+            <string name="Name">MicroProfilerHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local RunService = TS.import(script, script.Parent.Parent.Parent, "node_modules", "@rbxts", "services").RunService
+local DEFAULT_DURATION_MS = 1000
+local MIN_DURATION_MS = 100
+local MAX_DURATION_MS = 5000
+local DEFAULT_MAX_TIMERS = 20
+local DEFAULT_MAX_GROUPS = 20
+local DEFAULT_MAX_TIMERS_PER_GROUP = 5
+local DEFAULT_MAX_RELATED_TIMERS = 3
+local DEFAULT_MAX_EVENTS = 250000
+local MAX_EVENTS = 1000000
+local COOPERATIVE_CLOCK_CHECK_INTERVAL = 128
+local MAX_COOPERATIVE_SLICE_SECONDS = 0.008
+local DEFAULT_FRAME_WINDOW = 240
+local BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local PAD_BYTE = (string.byte("="))
+local B64 = {}
+for i = 0, 63 do
+	B64[i + 1] = (string.byte(BASE64_CHARS, i + 1))
+end
+local FOCUS_GROUP_MASKS = {
+	all = {},
+	script = { "Script", "LuaBridge" },
+	physics = { "Physics" },
+	render = { "Render" },
+	network = { "Network", "RbxTransport", "Replicator" },
+	jobs = { "Jobs" },
+}
+local cachedLibMP
+-- Sampling the clock avoids a timing call for every event while still bounding
+-- each VM resumption. Sorting uses the same checkpoint so no full sort is atomic.
+local function createCooperativeCheckpoint()
+	local operationsSinceClockCheck = 0
+	local sliceStartedAt = os.clock()
+	return function()
+		operationsSinceClockCheck += 1
+		if operationsSinceClockCheck < COOPERATIVE_CLOCK_CHECK_INTERVAL then
+			return nil
+		end
+		operationsSinceClockCheck = 0
+		if os.clock() - sliceStartedAt < MAX_COOPERATIVE_SLICE_SECONDS then
+			return nil
+		end
+		task.wait()
+		sliceStartedAt = os.clock()
+	end
+end
+local function cooperativeSort(values, comesBefore, checkpoint)
+	local count = #values
+	if count < 2 then
+		return nil
+	end
+	local function siftDown(start, lastIndex)
+		local root = start
+		while root * 2 + 1 <= lastIndex do
+			checkpoint()
+			local candidate = root
+			local left = root * 2 + 1
+			if comesBefore(values[candidate + 1], values[left + 1]) then
+				candidate = left
+			end
+			local right = left + 1
+			if right <= lastIndex and comesBefore(values[candidate + 1], values[right + 1]) then
+				candidate = right
+			end
+			if candidate == root then
+				return nil
+			end
+			local value = values[root + 1]
+			values[root + 1] = values[candidate + 1]
+			values[candidate + 1] = value
+			root = candidate
+		end
+	end
+	do
+		local start = math.floor((count - 2) / 2)
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				start -= 1
+			else
+				_shouldIncrement = true
+			end
+			if not (start >= 0) then
+				break
+			end
+			siftDown(start, count - 1)
+			checkpoint()
+		end
+	end
+	do
+		local lastIndex = count - 1
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				lastIndex -= 1
+			else
+				_shouldIncrement = true
+			end
+			if not (lastIndex > 0) then
+				break
+			end
+			local value = values[1]
+			values[1] = values[lastIndex + 1]
+			values[lastIndex + 1] = value
+			checkpoint()
+			siftDown(0, lastIndex - 1)
+		end
+	end
+end
+local function normalizeDurationMs(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_DURATION_MS
+	end
+	return math.clamp(math.floor(value), MIN_DURATION_MS, MAX_DURATION_MS)
+end
+local function normalizeMaxTimers(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_TIMERS
+	end
+	return math.clamp(math.floor(value), 1, 100)
+end
+local function normalizeMaxGroups(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_GROUPS
+	end
+	return math.clamp(math.floor(value), 1, 100)
+end
+local function normalizeMaxTimersPerGroup(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_TIMERS_PER_GROUP
+	end
+	return math.clamp(math.floor(value), 0, 20)
+end
+local function normalizeMaxRelatedTimers(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_RELATED_TIMERS
+	end
+	return math.clamp(math.floor(value), 0, 10)
+end
+local function normalizeMaxEvents(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_EVENTS
+	end
+	return math.clamp(math.floor(value), 10000, MAX_EVENTS)
+end
+local function normalizeFrameWindow(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_FRAME_WINDOW
+	end
+	return math.clamp(math.floor(value), 1, 2000)
+end
+local function normalizeMinTotalUs(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return 0
+	end
+	return math.max(0, value)
+end
+local function normalizeFocus(value)
+	local _value = value
+	local _condition = not (type(_value) == "string")
+	if not _condition then
+		_condition = FOCUS_GROUP_MASKS[value] == nil
+	end
+	if _condition then
+		return "all"
+	end
+	return value
+end
+local function stringContains(haystack, needle)
+	return (string.find(string.lower(haystack), string.lower(needle), 1, true)) ~= nil
+end
+local function rawToUs(raw)
+	return math.floor(raw / 1000 + 0.5)
+end
+local function round2(value)
+	return math.floor(value * 100 + 0.5) / 100
+end
+local function perSecond(value, durationMs)
+	return if durationMs > 0 then round2(value / (durationMs / 1000)) else value
+end
+local function percent(part, whole)
+	return if whole > 0 then round2((part / whole) * 100) else 0
+end
+local function ratio(numerator, denominator)
+	if denominator <= 0 then
+		return nil
+	end
+	return round2(numerator / denominator)
+end
+local function percentile(sortedValues, fraction)
+	if #sortedValues == 0 then
+		return 0
+	end
+	local index = math.clamp(math.ceil(#sortedValues * fraction), 1, #sortedValues) - 1
+	return sortedValues[index + 1]
+end
+local function copyRecord(row)
+	local out = {}
+	for key, value in pairs(row) do
+		out[key] = value
+	end
+	return out
+end
+local function pickFields(row, fields)
+	local out = {}
+	for _, field in fields do
+		local value = row[field]
+		if value ~= nil then
+			out[field] = value
+		end
+	end
+	return out
+end
+local function addFrameRaw(map, frameId, raw)
+	if frameId <= 0 then
+		return nil
+	end
+	local _map = map
+	local _exp = frameId
+	local _map_1 = map
+	local _frameId = frameId
+	local _condition = _map_1[_frameId]
+	if _condition == nil then
+		_condition = 0
+	end
+	local _arg1 = _condition + raw
+	_map[_exp] = _arg1
+end
+local function summarizeFrameImpact(frameRawById, analyzedFrames, checkpoint)
+	local _condition = frameRawById == nil
+	if not _condition then
+		-- ▼ ReadonlyMap.size ▼
+		local _size = 0
+		for _ in frameRawById do
+			_size += 1
+		end
+		-- ▲ ReadonlyMap.size ▲
+		_condition = _size == 0
+	end
+	if _condition then
+		return {
+			active_frame_count = 0,
+			active_frame_pct = 0,
+			inclusive_us_per_frame = 0,
+			p95_active_frame_inclusive_us = 0,
+			max_frame_inclusive_us = 0,
+		}
+	end
+	local values = {}
+	local totalUs = 0
+	local maxUs = 0
+	local maxFrameId = 0
+	for frameId, raw in frameRawById do
+		checkpoint()
+		local us = rawToUs(raw)
+		table.insert(values, us)
+		totalUs += us
+		if us > maxUs then
+			maxUs = us
+			maxFrameId = frameId
+		end
+	end
+	cooperativeSort(values, function(a, b)
+		return a < b
+	end, checkpoint)
+	return {
+		active_frame_count = #values,
+		active_frame_pct = percent(#values, analyzedFrames),
+		inclusive_us_per_frame = if analyzedFrames > 0 then round2(totalUs / analyzedFrames) else totalUs,
+		avg_active_frame_inclusive_us = if #values > 0 then round2(totalUs / #values) else 0,
+		p95_active_frame_inclusive_us = percentile(values, 0.95),
+		max_frame_inclusive_us = maxUs,
+		max_frame_id = maxFrameId,
+	}
+end
+local function encodeBase64(buf, checkpoint)
+	local len = buffer.len(buf)
+	local fullTriples = math.floor(len / 3)
+	local remaining = len - fullTriples * 3
+	local outLen = (fullTriples + (if remaining > 0 then 1 else 0)) * 4
+	local out = buffer.create(outLen)
+	local si = 0
+	local di = 0
+	do
+		local t = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				t += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (t < fullTriples) then
+				break
+			end
+			local b0 = buffer.readu8(buf, si)
+			local b1 = buffer.readu8(buf, si + 1)
+			local b2 = buffer.readu8(buf, si + 2)
+			buffer.writeu8(out, di, B64[bit32.rshift(b0, 2) + 1])
+			buffer.writeu8(out, di + 1, B64[bit32.bor(bit32.lshift(bit32.band(b0, 3), 4), bit32.rshift(b1, 4)) + 1])
+			buffer.writeu8(out, di + 2, B64[bit32.bor(bit32.lshift(bit32.band(b1, 15), 2), bit32.rshift(b2, 6)) + 1])
+			buffer.writeu8(out, di + 3, B64[bit32.band(b2, 63) + 1])
+			si += 3
+			di += 4
+			checkpoint()
+		end
+	end
+	if remaining == 2 then
+		local b0 = buffer.readu8(buf, si)
+		local b1 = buffer.readu8(buf, si + 1)
+		buffer.writeu8(out, di, B64[bit32.rshift(b0, 2) + 1])
+		buffer.writeu8(out, di + 1, B64[bit32.bor(bit32.lshift(bit32.band(b0, 3), 4), bit32.rshift(b1, 4)) + 1])
+		buffer.writeu8(out, di + 2, B64[bit32.lshift(bit32.band(b1, 15), 2) + 1])
+		buffer.writeu8(out, di + 3, PAD_BYTE)
+	elseif remaining == 1 then
+		local b0 = buffer.readu8(buf, si)
+		buffer.writeu8(out, di, B64[bit32.rshift(b0, 2) + 1])
+		buffer.writeu8(out, di + 1, B64[bit32.lshift(bit32.band(b0, 3), 4) + 1])
+		buffer.writeu8(out, di + 2, PAD_BYTE)
+		buffer.writeu8(out, di + 3, PAD_BYTE)
+	end
+	return buffer.tostring(out)
+end
+local function requireLibMP()
+	if cachedLibMP ~= nil then
+		return cachedLibMP
+	end
+	local includeFolder = script.Parent.Parent.Parent:FindFirstChild("include")
+	local libModule = includeFolder and includeFolder:FindFirstChild("LibMP")
+	if not libModule or not libModule:IsA("ModuleScript") then
+		return {
+			error = "libmp_missing",
+			message = "The MCP plugin bundle does not contain include/LibMP.",
+		}
+	end
+	local ok, libOrErr = pcall(function()
+		return require(libModule)
+	end)
+	if not ok then
+		return {
+			error = "libmp_require_failed",
+			message = tostring(libOrErr),
+		}
+	end
+	cachedLibMP = libOrErr
+	return cachedLibMP
+end
+local function safeCall(fn)
+	local ok, value = pcall(fn)
+	if ok then
+		return true, value
+	end
+	return false, tostring(value)
+end
+local function isIdleTimer(info)
+	local name = string.lower(info.name)
+	if name == "sleep" or name == "idle" then
+		return true
+	end
+	if (string.find(name, "sleep", 1, true)) ~= nil then
+		return true
+	end
+	return false
+end
+local function recommendedToolsForGroups(groups, targetRole)
+	local tools = {}
+	local seen = {}
+	for _, row in groups do
+		local group = row.group
+		if not (type(group) == "string") or seen[group] ~= nil then
+			continue
+		end
+		seen[group] = true
+		if group == "Script" or group == "LuaBridge" then
+			local _arg0 = {
+				tool = "capture_script_profiler",
+				arguments = {
+					target = targetRole,
+					duration_ms = 1000,
+				},
+				reason = "Script/LuaBridge timers are present.",
+			}
+			table.insert(tools, _arg0)
+		elseif group == "Physics" then
+			table.insert(tools, {
+				tool = "get_scene_analysis",
+				reason = "Physics timers are present; inspect scene complexity.",
+			})
+		elseif group == "Render" then
+			table.insert(tools, {
+				tool = "capture_screenshot",
+				reason = "Render timers are present; inspect visible scene/UI state.",
+			})
+		elseif group == "Network" or group == "RbxTransport" or group == "Replicator" then
+			table.insert(tools, {
+				tool = "get_runtime_logs",
+				reason = "Network/replication timers are present; correlate with gameplay events.",
+			})
+		elseif group == "Jobs" then
+			local _arg0 = {
+				tool = "capture_micro_profiler",
+				arguments = {
+					target = targetRole,
+					focus = "jobs",
+				},
+				reason = "Jobs timers are present; narrow to job lanes if needed.",
+			}
+			table.insert(tools, _arg0)
+		end
+		if #tools >= 3 then
+			break
+		end
+	end
+	return tools
+end
+local function collectFrameSummary(session, startFrame, frameMax, checkpoint)
+	local frameRows = {}
+	local durations = {}
+	local incompleteFrames = 0
+	local pausedFrames = 0
+	do
+		local _frameId = startFrame
+		local _shouldIncrement = false
+		while true do
+			local frameId = _frameId
+			if _shouldIncrement then
+				frameId += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (frameId <= frameMax) then
+				break
+			end
+			checkpoint()
+			local ok, descOrErr = safeCall(function()
+				return session:GetFrameDesc(frameId)
+			end)
+			if not ok or not (descOrErr ~= "" and descOrErr) then
+				_frameId = frameId
+				continue
+			end
+			local desc = descOrErr
+			local tickStart = desc:TickStartCpu()
+			local tickEnd = desc:TickEndCpu()
+			local durationRaw = tickEnd - tickStart
+			local isIncomplete = desc:IsIncomplete()
+			local isPaused = desc:IsPaused()
+			if isIncomplete then
+				incompleteFrames += 1
+			end
+			if isPaused then
+				pausedFrames += 1
+			end
+			if durationRaw <= 0 or durationRaw > 1000000000000 then
+				_frameId = frameId
+				continue
+			end
+			local durationUs = rawToUs(durationRaw)
+			table.insert(durations, durationUs)
+			local row = {
+				frame_id = frameId,
+				duration_us = durationUs,
+			}
+			if isIncomplete then
+				row.incomplete = true
+			end
+			if isPaused then
+				row.paused = true
+			end
+			table.insert(frameRows, row)
+			_frameId = frameId
+		end
+	end
+	cooperativeSort(durations, function(a, b)
+		return a < b
+	end, checkpoint)
+	cooperativeSort(frameRows, function(a, b)
+		return (a.duration_us) > (b.duration_us)
+	end, checkpoint)
+	local totalUs = 0
+	for _, duration in durations do
+		totalUs += duration
+		checkpoint()
+	end
+	local topFrames = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(10, #frameRows)) then
+				break
+			end
+			local _arg0 = frameRows[i + 1]
+			table.insert(topFrames, _arg0)
+		end
+	end
+	local count = #durations
+	return {
+		frames = count,
+		total_duration_us = totalUs,
+		avg_us = if count > 0 then round2(totalUs / count) else 0,
+		p50_us = percentile(durations, 0.5),
+		p95_us = percentile(durations, 0.95),
+		max_us = if count > 0 then durations[count] else 0,
+		incomplete_frames = incompleteFrames,
+		paused_frames = pausedFrames,
+		top_frames = topFrames,
+	}
+end
+local function captureMicroProfiler(requestData)
+	if not RunService:IsRunning() then
+		return {
+			error = "runtime_target_required",
+			message = 'MicroProfiler capture requires a running playtest target such as target=\"server\" or target=\"client-1\".',
+		}
+	end
+	local libOrError = requireLibMP()
+	if libOrError.Control == nil then
+		return libOrError
+	end
+	local LibMP = libOrError
+	local durationMs = normalizeDurationMs(requestData.duration_ms)
+	local maxTimers = normalizeMaxTimers(requestData.max_timers)
+	local maxGroups = normalizeMaxGroups(requestData.max_groups)
+	local maxTimersPerGroup = normalizeMaxTimersPerGroup(requestData.max_timers_per_group)
+	local maxRelatedTimers = normalizeMaxRelatedTimers(requestData.max_related_timers)
+	local maxEvents = normalizeMaxEvents(requestData.max_events)
+	local frameWindow = normalizeFrameWindow(requestData.frame_window)
+	local minTotalUs = normalizeMinTotalUs(requestData.min_total_us)
+	local focus = normalizeFocus(requestData.focus)
+	local _filter = requestData.filter
+	local _condition = type(_filter) == "string"
+	if _condition then
+		_condition = requestData.filter ~= ""
+	end
+	local filter = if _condition then requestData.filter else nil
+	local includeIdle = requestData.include_idle == true
+	local includeGpu = requestData.include_gpu == true
+	local includeRawBuffer = requestData.__mcp_include_raw_buffer == true
+	local includeComparisonIndex = requestData.__mcp_include_comparison_index == true
+	local ___mcp_target_role = requestData.__mcp_target_role
+	local targetRole = if type(___mcp_target_role) == "string" then requestData.__mcp_target_role else "runtime"
+	local backend = {
+		accessible = LibMP.Control:IsBackendAccessible(),
+		ready = LibMP.Control:IsBackendReady(),
+		compatible = LibMP.Control:IsBackendVersionCompatible(),
+		versions = LibMP.Versions,
+	}
+	if not backend.accessible or not backend.ready or not backend.compatible then
+		return {
+			error = "micro_profiler_backend_unavailable",
+			message = "MicroProfilerService backend is not accessible, ready, and compatible in this runtime peer.",
+			backend = backend,
+		}
+	end
+	local profilerOk, profilerResult = safeCall(function()
+		return LibMP.Control:EnableProfiler(true)
+	end)
+	if not profilerOk then
+		return {
+			error = "micro_profiler_enable_failed",
+			message = tostring(profilerResult),
+			backend = backend,
+		}
+	end
+	local captureStartOk, captureStartResult = safeCall(function()
+		return LibMP.Control:EnableCapture(true)
+	end)
+	if not captureStartOk then
+		return {
+			error = "micro_profiler_capture_start_failed",
+			message = tostring(captureStartResult),
+			backend = backend,
+		}
+	end
+	task.wait(durationMs / 1000)
+	local captureStopOk, captureStopResult = safeCall(function()
+		return LibMP.Control:EnableCapture(false)
+	end)
+	if not captureStopOk then
+		return {
+			error = "micro_profiler_capture_stop_failed",
+			message = tostring(captureStopResult),
+			backend = backend,
+		}
+	end
+	local bufferOk, snapshotOrErr = safeCall(function()
+		return LibMP.Control:CaptureToBufferSync()
+	end)
+	if not bufferOk then
+		return {
+			error = "micro_profiler_snapshot_failed",
+			message = tostring(snapshotOrErr),
+			backend = backend,
+		}
+	end
+	local snapshot = snapshotOrErr
+	local sessionOk, sessionOrErr = safeCall(function()
+		return LibMP.Session.OpenFromBuffer(snapshot)
+	end)
+	if not sessionOk or not (sessionOrErr ~= "" and sessionOrErr) then
+		return {
+			error = "micro_profiler_decode_failed",
+			message = tostring(sessionOrErr),
+			buffer_bytes = buffer.len(snapshot),
+			backend = backend,
+		}
+	end
+	local session = sessionOrErr
+	if not session:IsValid() then
+		session:Dispose()
+		return {
+			error = "micro_profiler_session_invalid",
+			buffer_bytes = buffer.len(snapshot),
+			backend = backend,
+		}
+	end
+	local timerIds = session:FetchTimerIds() or {}
+	local threadIds = session:FetchThreadIds() or {}
+	local frameMin = session:GetFrameIdMin()
+	local frameMax = session:GetFrameIdMax()
+	local startFrame = math.max(frameMin, frameMax - frameWindow + 1)
+	local framesConsidered = if frameMax >= startFrame then frameMax - startFrame + 1 else 0
+	local groupCache = {}
+	local timerCache = {}
+	local threadCache = {}
+	local function getGroupName(groupId)
+		if groupId == nil then
+			return nil
+		end
+		local _groupId = groupId
+		local cached = groupCache[_groupId]
+		if cached ~= nil then
+			return cached
+		end
+		local ok, descOrErr = safeCall(function()
+			return session:FetchGroupDesc(groupId)
+		end)
+		local desc = if ok then descOrErr else nil
+		local _condition_1 = desc
+		if _condition_1 then
+			local _groupName = desc.GroupName
+			_condition_1 = type(_groupName) == "string"
+			if _condition_1 then
+				_condition_1 = desc.GroupName ~= ""
+			end
+		end
+		local name = if _condition_1 then desc.GroupName else tostring(groupId)
+		local _groupId_1 = groupId
+		groupCache[_groupId_1] = name
+		return name
+	end
+	local function getTimerInfo(timerId)
+		local _timerId = timerId
+		local cached = timerCache[_timerId]
+		if cached ~= nil then
+			return cached
+		end
+		local ok, descOrErr = safeCall(function()
+			return session:FetchTimerDesc(timerId)
+		end)
+		local desc = if ok then descOrErr else nil
+		local _condition_1 = desc
+		if _condition_1 then
+			local _groupId = desc.GroupId
+			_condition_1 = type(_groupId) == "number"
+		end
+		local groupId = if _condition_1 then desc.GroupId else nil
+		local _object = {
+			timer_id = timerId,
+		}
+		local _left = "name"
+		local _condition_2 = desc
+		if _condition_2 then
+			local _timerName = desc.TimerName
+			_condition_2 = type(_timerName) == "string"
+			if _condition_2 then
+				_condition_2 = desc.TimerName ~= ""
+			end
+		end
+		_object[_left] = if _condition_2 then desc.TimerName else tostring(timerId)
+		_object.group_id = groupId
+		_object.group = getGroupName(groupId)
+		_object.is_user_timer = if desc and desc.IsUserTimer == true then true else nil
+		local info = _object
+		local _timerId_1 = timerId
+		timerCache[_timerId_1] = info
+		return info
+	end
+	local function getThreadInfo(threadId)
+		local _threadId = threadId
+		local cached = threadCache[_threadId]
+		if cached ~= nil then
+			return cached
+		end
+		local ok, descOrErr = safeCall(function()
+			return session:FetchThreadDesc(threadId)
+		end)
+		local desc = if ok then descOrErr else nil
+		local _object = {
+			thread_id = threadId,
+		}
+		local _left = "name"
+		local _condition_1 = desc
+		if _condition_1 then
+			local _threadName = desc.ThreadName
+			_condition_1 = type(_threadName) == "string"
+			if _condition_1 then
+				_condition_1 = desc.ThreadName ~= ""
+			end
+		end
+		_object[_left] = if _condition_1 then desc.ThreadName else tostring(threadId)
+		local info = _object
+		if desc and desc.IsGpu == true then
+			info.is_gpu = true
+		end
+		local _condition_2 = desc
+		if _condition_2 then
+			local _bufferSize = desc.BufferSize
+			_condition_2 = type(_bufferSize) == "number"
+		end
+		if _condition_2 then
+			info.buffer_size = desc.BufferSize
+		end
+		local _threadId_1 = threadId
+		threadCache[_threadId_1] = info
+		return info
+	end
+	local function addTimerAggregate(map, timerId, inclusiveRaw, exclusiveRaw)
+		local _map = map
+		local _timerId = timerId
+		local aggregate = _map[_timerId]
+		if aggregate == nil then
+			aggregate = {
+				timer_id = timerId,
+				inclusive_raw = 0,
+				exclusive_raw = 0,
+				count = 0,
+				max_raw = 0,
+			}
+			local _map_1 = map
+			local _timerId_1 = timerId
+			local _aggregate = aggregate
+			_map_1[_timerId_1] = _aggregate
+		end
+		aggregate.inclusive_raw += inclusiveRaw
+		aggregate.exclusive_raw += exclusiveRaw
+		aggregate.count += 1
+		if inclusiveRaw > aggregate.max_raw then
+			aggregate.max_raw = inclusiveRaw
+		end
+	end
+	local focusMasks = FOCUS_GROUP_MASKS[focus] or {}
+	local focusGroupIds = {}
+	for _, mask in focusMasks do
+		local ok, idsOrErr = safeCall(function()
+			return session:FindGroupIds(mask, false)
+		end)
+		if ok and type(idsOrErr) == "table" then
+			for _1, id in idsOrErr do
+				if not (table.find(focusGroupIds, id) ~= nil) then
+					table.insert(focusGroupIds, id)
+				end
+			end
+		end
+	end
+	local iteratorConfig = {
+		StartFrameId = startFrame,
+		EndFrameId = frameMax,
+		SkipGpuThreads = not includeGpu,
+		SkipEvents = true,
+		SkipPausedFrames = true,
+		SkipFrameBoundaries = true,
+	}
+	if #focusGroupIds > 0 then
+		iteratorConfig.GroupIds = focusGroupIds
+	end
+	local iterator = session:CreateLogIterator()
+	local configOk, configErr = safeCall(function()
+		iterator:Configure(iteratorConfig)
+		return true
+	end)
+	if not configOk then
+		iterator:Dispose()
+		session:Dispose()
+		return {
+			error = "micro_profiler_iterator_config_failed",
+			message = tostring(configErr),
+			backend = backend,
+		}
+	end
+	local checkpoint = createCooperativeCheckpoint()
+	local stacks = {}
+	local aggregates = {}
+	local timerThreadAggregates = {}
+	local timerFrameAggregates = {}
+	local edgeAggregates = {}
+	local sampledFrames = {}
+	local eventsSampled = 0
+	local enterEvents = 0
+	local exitEvents = 0
+	local unmatchedExits = 0
+	local droppedSpans = 0
+	local sampledFrameMin
+	local sampledFrameMax
+	local lastProcessedFrameId
+	local lastProcessedTimestampRaw
+	while eventsSampled < maxEvents do
+		checkpoint()
+		if not iterator:Step() then
+			break
+		end
+		eventsSampled += 1
+		local state = iterator:GetState()
+		if not state then
+			continue
+		end
+		local frameId = state:FrameId()
+		local threadId = state:ThreadId()
+		local timerId = state:TimerId()
+		local timestampRaw = state:Timestamp()
+		lastProcessedFrameId = frameId
+		lastProcessedTimestampRaw = timestampRaw
+		if frameId > 0 then
+			sampledFrames[frameId] = true
+			if sampledFrameMin == nil or frameId < sampledFrameMin then
+				sampledFrameMin = frameId
+			end
+			if sampledFrameMax == nil or frameId > sampledFrameMax then
+				sampledFrameMax = frameId
+			end
+		end
+		local stack = stacks[threadId]
+		if stack == nil then
+			stack = {}
+			local _stack = stack
+			stacks[threadId] = _stack
+		end
+		if state:IsEnter() then
+			enterEvents += 1
+			local _stack = stack
+			local _arg0 = {
+				timerId = timerId,
+				timestampRaw = timestampRaw,
+				childRaw = 0,
+				frameId = frameId,
+			}
+			table.insert(_stack, _arg0)
+		elseif state:IsExit() then
+			exitEvents += 1
+			local entry
+			while #stack > 0 do
+				checkpoint()
+				-- ▼ Array.pop ▼
+				local _length = #stack
+				local _result = stack[_length]
+				stack[_length] = nil
+				-- ▲ Array.pop ▲
+				local candidate = _result
+				if candidate and candidate.timerId == timerId then
+					entry = candidate
+					break
+				end
+			end
+			if entry == nil then
+				unmatchedExits += 1
+				continue
+			end
+			local inclusiveRaw = timestampRaw - entry.timestampRaw
+			if inclusiveRaw < 0 or inclusiveRaw > 1000000000000 then
+				droppedSpans += 1
+				continue
+			end
+			local exclusiveRaw = math.max(0, inclusiveRaw - entry.childRaw)
+			local parent = stack[#stack]
+			if parent ~= nil then
+				parent.childRaw += inclusiveRaw
+				local edgeKey = `{parent.timerId}:{timerId}`
+				local edge = edgeAggregates[edgeKey]
+				if edge == nil then
+					edge = {
+						parent_timer_id = parent.timerId,
+						child_timer_id = timerId,
+						inclusive_raw = 0,
+						count = 0,
+						max_raw = 0,
+					}
+					local _edge = edge
+					edgeAggregates[edgeKey] = _edge
+				end
+				edge.inclusive_raw += inclusiveRaw
+				edge.count += 1
+				if inclusiveRaw > edge.max_raw then
+					edge.max_raw = inclusiveRaw
+				end
+			end
+			addTimerAggregate(aggregates, timerId, inclusiveRaw, exclusiveRaw)
+			local frameMap = timerFrameAggregates[timerId]
+			if frameMap == nil then
+				frameMap = {}
+				local _frameMap = frameMap
+				timerFrameAggregates[timerId] = _frameMap
+			end
+			addFrameRaw(frameMap, if entry.frameId > 0 then entry.frameId else frameId, inclusiveRaw)
+			local threadMap = timerThreadAggregates[timerId]
+			if threadMap == nil then
+				threadMap = {}
+				local _threadMap = threadMap
+				timerThreadAggregates[timerId] = _threadMap
+			end
+			addTimerAggregate(threadMap, threadId, inclusiveRaw, exclusiveRaw)
+		end
+	end
+	-- ▼ ReadonlySet.size ▼
+	local _size = 0
+	for _ in sampledFrames do
+		_size += 1
+	end
+	-- ▲ ReadonlySet.size ▲
+	local sampledFrameCoveragePct = percent(_size, framesConsidered)
+	local _condition_1 = sampledFrameMin
+	if _condition_1 == nil then
+		_condition_1 = startFrame
+	end
+	local analysisFrameMin = _condition_1
+	local _condition_2 = sampledFrameMax
+	if _condition_2 == nil then
+		_condition_2 = frameMax
+	end
+	local analysisFrameMax = _condition_2
+	local frameSummary = collectFrameSummary(session, analysisFrameMin, analysisFrameMax, checkpoint)
+	local _frames = frameSummary.frames
+	local _condition_3 = type(_frames) == "number"
+	if _condition_3 then
+		_condition_3 = (frameSummary.frames) > 0
+	end
+	local _result
+	if _condition_3 then
+		_result = frameSummary.frames
+	else
+		-- ▼ ReadonlySet.size ▼
+		local _size_1 = 0
+		for _ in sampledFrames do
+			_size_1 += 1
+		end
+		-- ▲ ReadonlySet.size ▲
+		local _result_1
+		if _size_1 > 0 then
+			-- ▼ ReadonlySet.size ▼
+			local _size_2 = 0
+			for _ in sampledFrames do
+				_size_2 += 1
+			end
+			-- ▲ ReadonlySet.size ▲
+			_result_1 = _size_2
+		else
+			_result_1 = framesConsidered
+		end
+		_result = _result_1
+	end
+	local analysisFrameCount = _result
+	local _total_duration_us = frameSummary.total_duration_us
+	local _condition_4 = type(_total_duration_us) == "number"
+	if _condition_4 then
+		_condition_4 = (frameSummary.total_duration_us) > 0
+	end
+	local analysisDurationUs = if _condition_4 then frameSummary.total_duration_us else durationMs * 1000
+	local analysisDurationMs = analysisDurationUs / 1000
+	local rows = {}
+	local rowsByTimerId = {}
+	local groupAggregates = {}
+	local groupTimerRows = {}
+	local groupFrameAggregates = {}
+	local threadAggregates = {}
+	local threadTimerRows = {}
+	local omittedIdle = 0
+	local omittedBelowThreshold = 0
+	local omittedByFilter = 0
+	for timerId, aggregate in aggregates do
+		checkpoint()
+		local info = getTimerInfo(timerId)
+		local totalUs = rawToUs(aggregate.inclusive_raw)
+		if not includeIdle and isIdleTimer(info) then
+			omittedIdle += 1
+			continue
+		end
+		if totalUs < minTotalUs then
+			omittedBelowThreshold += 1
+			continue
+		end
+		if filter ~= nil then
+			local _exp = info.name
+			local _condition_5 = info.group
+			if _condition_5 == nil then
+				_condition_5 = ""
+			end
+			local searchable = `{_exp} {_condition_5}`
+			if not stringContains(searchable, filter) then
+				omittedByFilter += 1
+				continue
+			end
+		end
+		local _condition_5 = info.group
+		if _condition_5 == nil then
+			_condition_5 = "<unknown>"
+		end
+		local group = _condition_5
+		local inclusiveUs = rawToUs(aggregate.inclusive_raw)
+		local exclusiveUs = rawToUs(aggregate.exclusive_raw)
+		local avgUs = if aggregate.count > 0 then round2(totalUs / aggregate.count) else 0
+		local maxUs = rawToUs(aggregate.max_raw)
+		local groupAgg = groupAggregates[group]
+		if groupAgg == nil then
+			groupAgg = {
+				group = group,
+				inclusive_raw = 0,
+				exclusive_raw = 0,
+				count = 0,
+			}
+			local _groupAgg = groupAgg
+			groupAggregates[group] = _groupAgg
+		end
+		groupAgg.inclusive_raw += aggregate.inclusive_raw
+		groupAgg.exclusive_raw += aggregate.exclusive_raw
+		groupAgg.count += aggregate.count
+		local row = {
+			timer_id = timerId,
+			name = info.name,
+			group = group,
+			inclusive_us = inclusiveUs,
+			inclusive_us_per_s = perSecond(inclusiveUs, analysisDurationMs),
+			exclusive_us = exclusiveUs,
+			exclusive_pct = percent(exclusiveUs, inclusiveUs),
+			count = aggregate.count,
+			count_per_s = perSecond(aggregate.count, analysisDurationMs),
+			count_per_frame = if analysisFrameCount > 0 then round2(aggregate.count / analysisFrameCount) else aggregate.count,
+			avg_invocation_us = avgUs,
+			max_invocation_us = maxUs,
+			pct_of_analyzed_wall = percent(inclusiveUs, analysisDurationUs),
+		}
+		local maxToAvg = ratio(maxUs, avgUs)
+		if maxToAvg ~= nil then
+			row.max_to_avg = maxToAvg
+		end
+		local timerFrameImpact = summarizeFrameImpact(timerFrameAggregates[timerId], analysisFrameCount, checkpoint)
+		for key, value in pairs(timerFrameImpact) do
+			row[key] = value
+		end
+		if info.is_user_timer == true then
+			row.is_user_timer = true
+		end
+		table.insert(rows, row)
+		rowsByTimerId[timerId] = row
+		local timerRows = groupTimerRows[group]
+		if timerRows == nil then
+			timerRows = {}
+			local _timerRows = timerRows
+			groupTimerRows[group] = _timerRows
+		end
+		table.insert(timerRows, row)
+		local timerFrames = timerFrameAggregates[timerId]
+		if timerFrames ~= nil then
+			local groupFrames = groupFrameAggregates[group]
+			if groupFrames == nil then
+				groupFrames = {}
+				local _groupFrames = groupFrames
+				groupFrameAggregates[group] = _groupFrames
+			end
+			for frameId, raw in timerFrames do
+				addFrameRaw(groupFrames, frameId, raw)
+				checkpoint()
+			end
+		end
+		local perThread = timerThreadAggregates[timerId]
+		if perThread ~= nil then
+			local timerThreadSummaryRows = {}
+			for threadId, threadAggregate in perThread do
+				checkpoint()
+				local threadAggregateRow = threadAggregates[threadId]
+				if threadAggregateRow == nil then
+					threadAggregateRow = {
+						timer_id = threadId,
+						inclusive_raw = 0,
+						exclusive_raw = 0,
+						count = 0,
+						max_raw = 0,
+					}
+					local _threadAggregateRow = threadAggregateRow
+					threadAggregates[threadId] = _threadAggregateRow
+				end
+				threadAggregateRow.inclusive_raw += threadAggregate.inclusive_raw
+				threadAggregateRow.exclusive_raw += threadAggregate.exclusive_raw
+				threadAggregateRow.count += threadAggregate.count
+				if threadAggregate.max_raw > threadAggregateRow.max_raw then
+					threadAggregateRow.max_raw = threadAggregate.max_raw
+				end
+				local threadRows = threadTimerRows[threadId]
+				if threadRows == nil then
+					threadRows = {}
+					local _threadRows = threadRows
+					threadTimerRows[threadId] = _threadRows
+				end
+				local threadTotalUs = rawToUs(threadAggregate.inclusive_raw)
+				local threadExclusiveUs = rawToUs(threadAggregate.exclusive_raw)
+				local threadAvgUs = if threadAggregate.count > 0 then round2(threadTotalUs / threadAggregate.count) else 0
+				local threadInfo = getThreadInfo(threadId)
+				local threadTimerRow = {
+					thread_id = threadId,
+					thread_name = threadInfo.name,
+					is_gpu = threadInfo.is_gpu,
+					timer_id = timerId,
+					name = info.name,
+					group = group,
+					inclusive_us = threadTotalUs,
+					inclusive_us_per_s = perSecond(threadTotalUs, analysisDurationMs),
+					exclusive_us = threadExclusiveUs,
+					count = threadAggregate.count,
+					count_per_s = perSecond(threadAggregate.count, analysisDurationMs),
+					avg_invocation_us = threadAvgUs,
+					max_invocation_us = rawToUs(threadAggregate.max_raw),
+				}
+				local threadMaxToAvg = ratio(threadTimerRow.max_invocation_us, threadAvgUs)
+				if threadMaxToAvg ~= nil then
+					threadTimerRow.max_to_avg = threadMaxToAvg
+				end
+				table.insert(threadRows, threadTimerRow)
+				local _arg0 = {
+					thread_id = threadId,
+					thread_name = threadInfo.name,
+					is_gpu = threadInfo.is_gpu,
+					inclusive_us = threadTotalUs,
+					exclusive_us = threadExclusiveUs,
+					count = threadAggregate.count,
+				}
+				table.insert(timerThreadSummaryRows, _arg0)
+			end
+			cooperativeSort(timerThreadSummaryRows, function(a, b)
+				return (a.inclusive_us) > (b.inclusive_us)
+			end, checkpoint)
+			if maxRelatedTimers > 0 and #timerThreadSummaryRows > 0 then
+				local topTimerThreads = {}
+				do
+					local i = 0
+					local _shouldIncrement = false
+					while true do
+						if _shouldIncrement then
+							i += 1
+						else
+							_shouldIncrement = true
+						end
+						if not (i < math.min(maxRelatedTimers, #timerThreadSummaryRows)) then
+							break
+						end
+						local _arg0 = timerThreadSummaryRows[i + 1]
+						table.insert(topTimerThreads, _arg0)
+					end
+				end
+				row.top_threads = topTimerThreads
+			end
+		end
+	end
+	cooperativeSort(rows, function(a, b)
+		return (a.inclusive_us) > (b.inclusive_us)
+	end, checkpoint)
+	local edgeRows = {}
+	local parentRelationsByChild = {}
+	local childRelationsByParent = {}
+	for _, edge in edgeAggregates do
+		checkpoint()
+		local _parent_timer_id = edge.parent_timer_id
+		local parentRow = rowsByTimerId[_parent_timer_id]
+		local _child_timer_id = edge.child_timer_id
+		local childRow = rowsByTimerId[_child_timer_id]
+		if parentRow == nil or childRow == nil then
+			continue
+		end
+		local inclusiveUs = rawToUs(edge.inclusive_raw)
+		local maxUs = rawToUs(edge.max_raw)
+		local avgUs = if edge.count > 0 then round2(inclusiveUs / edge.count) else 0
+		local edgeRow = {
+			parent = {
+				timer_id = edge.parent_timer_id,
+				name = parentRow.name,
+				group = parentRow.group,
+			},
+			child = {
+				timer_id = edge.child_timer_id,
+				name = childRow.name,
+				group = childRow.group,
+			},
+			inclusive_us = inclusiveUs,
+			inclusive_us_per_s = perSecond(inclusiveUs, analysisDurationMs),
+			count = edge.count,
+			count_per_s = perSecond(edge.count, analysisDurationMs),
+			avg_invocation_us = avgUs,
+			max_invocation_us = maxUs,
+		}
+		local maxToAvg = ratio(maxUs, avgUs)
+		if maxToAvg ~= nil then
+			edgeRow.max_to_avg = maxToAvg
+		end
+		table.insert(edgeRows, edgeRow)
+		local _child_timer_id_1 = edge.child_timer_id
+		local parentRelations = parentRelationsByChild[_child_timer_id_1]
+		if parentRelations == nil then
+			parentRelations = {}
+			local _child_timer_id_2 = edge.child_timer_id
+			local _parentRelations = parentRelations
+			parentRelationsByChild[_child_timer_id_2] = _parentRelations
+		end
+		local _parentRelations = parentRelations
+		local _arg0 = {
+			timer_id = edge.parent_timer_id,
+			name = parentRow.name,
+			group = parentRow.group,
+			inclusive_us = inclusiveUs,
+			count = edge.count,
+			pct_of_timer_inclusive = percent(inclusiveUs, childRow.inclusive_us),
+		}
+		table.insert(_parentRelations, _arg0)
+		local _parent_timer_id_1 = edge.parent_timer_id
+		local childRelations = childRelationsByParent[_parent_timer_id_1]
+		if childRelations == nil then
+			childRelations = {}
+			local _parent_timer_id_2 = edge.parent_timer_id
+			local _childRelations = childRelations
+			childRelationsByParent[_parent_timer_id_2] = _childRelations
+		end
+		local _childRelations = childRelations
+		local _arg0_1 = {
+			timer_id = edge.child_timer_id,
+			name = childRow.name,
+			group = childRow.group,
+			inclusive_us = inclusiveUs,
+			count = edge.count,
+			pct_of_timer_inclusive = percent(inclusiveUs, parentRow.inclusive_us),
+		}
+		table.insert(_childRelations, _arg0_1)
+	end
+	cooperativeSort(edgeRows, function(a, b)
+		return (a.inclusive_us) > (b.inclusive_us)
+	end, checkpoint)
+	if maxRelatedTimers > 0 then
+		for _, relationRows in parentRelationsByChild do
+			checkpoint()
+			cooperativeSort(relationRows, function(a, b)
+				return (a.inclusive_us) > (b.inclusive_us)
+			end, checkpoint)
+		end
+		for _, relationRows in childRelationsByParent do
+			checkpoint()
+			cooperativeSort(relationRows, function(a, b)
+				return (a.inclusive_us) > (b.inclusive_us)
+			end, checkpoint)
+		end
+		for _, row in rows do
+			checkpoint()
+			local timerId = row.timer_id
+			local parents = parentRelationsByChild[timerId]
+			local children = childRelationsByParent[timerId]
+			if parents ~= nil and #parents > 0 then
+				local topParents = {}
+				do
+					local i = 0
+					local _shouldIncrement = false
+					while true do
+						if _shouldIncrement then
+							i += 1
+						else
+							_shouldIncrement = true
+						end
+						if not (i < math.min(maxRelatedTimers, #parents)) then
+							break
+						end
+						local _arg0 = parents[i + 1]
+						table.insert(topParents, _arg0)
+					end
+				end
+				row.top_parents = topParents
+			end
+			if children ~= nil and #children > 0 then
+				local topChildren = {}
+				do
+					local i = 0
+					local _shouldIncrement = false
+					while true do
+						if _shouldIncrement then
+							i += 1
+						else
+							_shouldIncrement = true
+						end
+						if not (i < math.min(maxRelatedTimers, #children)) then
+							break
+						end
+						local _arg0 = children[i + 1]
+						table.insert(topChildren, _arg0)
+					end
+				end
+				row.top_children = topChildren
+			end
+		end
+	end
+	local topTimers = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxTimers, #rows)) then
+				break
+			end
+			local row = copyRecord(rows[i + 1])
+			row.rank = i + 1
+			table.insert(topTimers, row)
+		end
+	end
+	local rowsByExclusive = {}
+	for _, row in rows do
+		table.insert(rowsByExclusive, row)
+		checkpoint()
+	end
+	cooperativeSort(rowsByExclusive, function(a, b)
+		return (a.exclusive_us) > (b.exclusive_us)
+	end, checkpoint)
+	local topTimersByExclusive = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxTimers, #rowsByExclusive)) then
+				break
+			end
+			local row = copyRecord(rowsByExclusive[i + 1])
+			row.rank = i + 1
+			table.insert(topTimersByExclusive, row)
+		end
+	end
+	local topEdges = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxTimers, #edgeRows)) then
+				break
+			end
+			local row = copyRecord(edgeRows[i + 1])
+			row.rank = i + 1
+			table.insert(topEdges, row)
+		end
+	end
+	local threadRows = {}
+	for threadId, aggregate in threadAggregates do
+		checkpoint()
+		local info = getThreadInfo(threadId)
+		local inclusiveUs = rawToUs(aggregate.inclusive_raw)
+		local exclusiveUs = rawToUs(aggregate.exclusive_raw)
+		local row = {
+			thread_id = threadId,
+			thread_name = info.name,
+			is_gpu = info.is_gpu,
+			inclusive_us = inclusiveUs,
+			inclusive_us_per_s = perSecond(inclusiveUs, analysisDurationMs),
+			exclusive_us = exclusiveUs,
+			exclusive_pct = percent(exclusiveUs, inclusiveUs),
+			count = aggregate.count,
+			count_per_s = perSecond(aggregate.count, analysisDurationMs),
+			max_invocation_us = rawToUs(aggregate.max_raw),
+			pct_of_analyzed_wall = percent(inclusiveUs, analysisDurationUs),
+		}
+		local timerRows = threadTimerRows[threadId] or {}
+		cooperativeSort(timerRows, function(a, b)
+			return (a.inclusive_us) > (b.inclusive_us)
+		end, checkpoint)
+		local topThreadTimers = {}
+		do
+			local i = 0
+			local _shouldIncrement = false
+			while true do
+				if _shouldIncrement then
+					i += 1
+				else
+					_shouldIncrement = true
+				end
+				if not (i < math.min(maxTimersPerGroup, #timerRows)) then
+					break
+				end
+				local timerRow = copyRecord(timerRows[i + 1])
+				table.insert(topThreadTimers, timerRow)
+			end
+		end
+		if #topThreadTimers > 0 then
+			row.top_timers = topThreadTimers
+		end
+		table.insert(threadRows, row)
+	end
+	cooperativeSort(threadRows, function(a, b)
+		return (a.inclusive_us) > (b.inclusive_us)
+	end, checkpoint)
+	local topThreads = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxGroups, #threadRows)) then
+				break
+			end
+			local row = threadRows[i + 1]
+			row.rank = i + 1
+			table.insert(topThreads, row)
+		end
+	end
+	local groupRows = {}
+	for _, aggregate in groupAggregates do
+		checkpoint()
+		local _group = aggregate.group
+		local _condition_5 = groupTimerRows[_group]
+		if _condition_5 == nil then
+			_condition_5 = {}
+		end
+		local timerRows = _condition_5
+		cooperativeSort(timerRows, function(a, b)
+			return (a.inclusive_us) > (b.inclusive_us)
+		end, checkpoint)
+		local topGroupTimers = {}
+		do
+			local i = 0
+			local _shouldIncrement = false
+			while true do
+				if _shouldIncrement then
+					i += 1
+				else
+					_shouldIncrement = true
+				end
+				if not (i < math.min(maxTimersPerGroup, #timerRows)) then
+					break
+				end
+				local timerRow = timerRows[i + 1]
+				local _arg0 = {
+					timer_id = timerRow.timer_id,
+					name = timerRow.name,
+					inclusive_us = timerRow.inclusive_us,
+					inclusive_us_per_s = timerRow.inclusive_us_per_s,
+					exclusive_us = timerRow.exclusive_us,
+					count = timerRow.count,
+					max_invocation_us = timerRow.max_invocation_us,
+					max_frame_inclusive_us = timerRow.max_frame_inclusive_us,
+				}
+				table.insert(topGroupTimers, _arg0)
+			end
+		end
+		local inclusiveUs = rawToUs(aggregate.inclusive_raw)
+		local exclusiveUs = rawToUs(aggregate.exclusive_raw)
+		local groupRow = {
+			group = aggregate.group,
+			inclusive_us = inclusiveUs,
+			inclusive_us_per_s = perSecond(inclusiveUs, analysisDurationMs),
+			exclusive_us = exclusiveUs,
+			exclusive_pct = percent(exclusiveUs, inclusiveUs),
+			count = aggregate.count,
+			count_per_s = perSecond(aggregate.count, analysisDurationMs),
+			count_per_frame = if analysisFrameCount > 0 then round2(aggregate.count / analysisFrameCount) else aggregate.count,
+			timer_count = #timerRows,
+			pct_of_analyzed_wall = percent(inclusiveUs, analysisDurationUs),
+		}
+		local _group_1 = aggregate.group
+		local groupFrameImpact = summarizeFrameImpact(groupFrameAggregates[_group_1], analysisFrameCount, checkpoint)
+		for key, value in pairs(groupFrameImpact) do
+			groupRow[key] = value
+		end
+		if #topGroupTimers > 0 then
+			groupRow.top_timers = topGroupTimers
+		end
+		table.insert(groupRows, groupRow)
+	end
+	cooperativeSort(groupRows, function(a, b)
+		return (a.inclusive_us) > (b.inclusive_us)
+	end, checkpoint)
+	local topGroups = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxGroups, #groupRows)) then
+				break
+			end
+			local row = copyRecord(groupRows[i + 1])
+			row.rank = i + 1
+			table.insert(topGroups, row)
+		end
+	end
+	local groupRowsByExclusive = {}
+	for _, row in groupRows do
+		table.insert(groupRowsByExclusive, row)
+		checkpoint()
+	end
+	cooperativeSort(groupRowsByExclusive, function(a, b)
+		return (a.exclusive_us) > (b.exclusive_us)
+	end, checkpoint)
+	local topGroupsByExclusive = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxGroups, #groupRowsByExclusive)) then
+				break
+			end
+			local row = copyRecord(groupRowsByExclusive[i + 1])
+			row.rank = i + 1
+			table.insert(topGroupsByExclusive, row)
+		end
+	end
+	local omitted = {}
+	if omittedIdle > 0 then
+		omitted.idle = omittedIdle
+	end
+	if omittedBelowThreshold > 0 then
+		omitted.below_min_total_us = omittedBelowThreshold
+	end
+	if omittedByFilter > 0 then
+		omitted.filtered_out = omittedByFilter
+	end
+	local openStackEntriesAtEnd = 0
+	for _, stack in stacks do
+		openStackEntriesAtEnd += #stack
+		checkpoint()
+	end
+	local iteratorFinished = eventsSampled < maxEvents
+	local partialReasons = {}
+	if eventsSampled >= maxEvents then
+		table.insert(partialReasons, "event_limit_hit")
+	end
+	if openStackEntriesAtEnd > 0 then
+		table.insert(partialReasons, "open_stack_entries_at_end")
+	end
+	if sampledFrameCoveragePct < 100 then
+		table.insert(partialReasons, "selected_frame_event_coverage_below_100")
+	end
+	local comparisonIndex
+	if includeComparisonIndex then
+		local timerFields = { "timer_id", "name", "group", "inclusive_us", "inclusive_us_per_s", "exclusive_us", "count", "count_per_s", "active_frame_count", "inclusive_us_per_frame", "max_frame_inclusive_us", "max_frame_id" }
+		local groupFields = { "group", "inclusive_us", "inclusive_us_per_s", "exclusive_us", "count", "timer_count", "active_frame_count", "inclusive_us_per_frame", "max_frame_inclusive_us", "max_frame_id" }
+		local threadFields = { "thread_id", "thread_name", "is_gpu", "inclusive_us", "inclusive_us_per_s", "exclusive_us", "count" }
+		local edgeFields = { "parent", "child", "inclusive_us", "inclusive_us_per_s", "count", "max_invocation_us" }
+		local timerIndex = {}
+		for _, row in rows do
+			local _arg0 = pickFields(row, timerFields)
+			table.insert(timerIndex, _arg0)
+			checkpoint()
+		end
+		local groupIndex = {}
+		for _, row in groupRows do
+			local _arg0 = pickFields(row, groupFields)
+			table.insert(groupIndex, _arg0)
+			checkpoint()
+		end
+		local threadIndex = {}
+		for _, row in threadRows do
+			local _arg0 = pickFields(row, threadFields)
+			table.insert(threadIndex, _arg0)
+			checkpoint()
+		end
+		local edgeIndex = {}
+		for _, row in edgeRows do
+			local _arg0 = pickFields(row, edgeFields)
+			table.insert(edgeIndex, _arg0)
+			checkpoint()
+		end
+		comparisonIndex = {
+			timers = timerIndex,
+			groups = groupIndex,
+			threads = threadIndex,
+			call_edges = edgeIndex,
+		}
+	end
+	local _object = {
+		schema_version = 1,
+		ok = true,
+		duration_ms = durationMs,
+		target = targetRole,
+		scope = "micro_profiler",
+		time_unit = "microseconds",
+		time_basis = "LibMP MicroProfiler timestamps converted from nanosecond ticks. inclusive_us is cumulative nested timer time and can overlap across nested timers/threads; do not sum rows as total frame time.",
+	}
+	local _left = "analysis_window"
+	local _object_1 = {
+		requested_duration_ms = durationMs,
+		analysis_duration_us = analysisDurationUs,
+		snapshot_frame_min = frameMin,
+		snapshot_frame_max = frameMax,
+		selected_frame_min = startFrame,
+		selected_frame_max = frameMax,
+		selected_frame_count = framesConsidered,
+		analyzed_frame_min = analysisFrameMin,
+		analyzed_frame_max = analysisFrameMax,
+		analyzed_frame_count = analysisFrameCount,
+		processed_frame_min = sampledFrameMin,
+		processed_frame_max = sampledFrameMax,
+	}
+	local _left_1 = "processed_frame_count"
+	-- ▼ ReadonlySet.size ▼
+	local _size_1 = 0
+	for _ in sampledFrames do
+		_size_1 += 1
+	end
+	-- ▲ ReadonlySet.size ▲
+	_object_1[_left_1] = _size_1
+	_object_1.selected_frame_event_coverage_pct = sampledFrameCoveragePct
+	_object_1.frame_window = frameWindow
+	_object[_left] = _object_1
+	local _left_2 = "applied"
+	local _object_2 = {
+		focus = focus,
+	}
+	local _left_3 = "filter"
+	local _condition_5 = filter
+	if _condition_5 == nil then
+		_condition_5 = nil
+	end
+	_object_2[_left_3] = _condition_5
+	_object_2.include_idle = includeIdle
+	_object_2.include_gpu = includeGpu
+	_object_2.min_total_us = minTotalUs
+	_object_2.max_groups = maxGroups
+	_object_2.max_timers = maxTimers
+	_object_2.max_timers_per_group = maxTimersPerGroup
+	_object_2.max_related_timers = maxRelatedTimers
+	_object_2.max_events = maxEvents
+	_object_2.frame_window = frameWindow
+	_object_2.sort = "inclusive_us_desc"
+	_object[_left_2] = _object_2
+	local _left_4 = "counts"
+	local _object_3 = {
+		buffer_bytes = buffer.len(snapshot),
+		timers = #timerIds,
+		threads = #threadIds,
+		frame_min = frameMin,
+		frame_max = frameMax,
+		frames_considered = framesConsidered,
+		sampled_frame_min = sampledFrameMin,
+		sampled_frame_max = sampledFrameMax,
+	}
+	local _left_5 = "sampled_frames"
+	-- ▼ ReadonlySet.size ▼
+	local _size_2 = 0
+	for _ in sampledFrames do
+		_size_2 += 1
+	end
+	-- ▲ ReadonlySet.size ▲
+	_object_3[_left_5] = _size_2
+	_object_3.events_sampled = eventsSampled
+	_object_3.enter_events = enterEvents
+	_object_3.exit_events = exitEvents
+	_object_3.unmatched_exits = unmatchedExits
+	_object_3.dropped_spans = droppedSpans
+	_object_3.open_stack_entries_at_end = openStackEntriesAtEnd
+	_object_3.iterator_finished = iteratorFinished
+	_object_3.last_processed_frame_id = lastProcessedFrameId
+	_object_3.last_processed_timestamp_us = if lastProcessedTimestampRaw ~= nil then rawToUs(lastProcessedTimestampRaw) else nil
+	_object_3.event_limit_hit = eventsSampled >= maxEvents
+	_object[_left_4] = _object_3
+	_object.frame_summary = frameSummary
+	_object.top_groups = topGroups
+	_object.top_groups_by_exclusive = topGroupsByExclusive
+	_object.top_threads = topThreads
+	_object.top_call_edges = topEdges
+	_object.top_timers = topTimers
+	_object.top_timers_by_exclusive = topTimersByExclusive
+	_object.data_quality = {
+		event_limit_hit = eventsSampled >= maxEvents,
+		iterator_finished = iteratorFinished,
+		unmatched_exits = unmatchedExits,
+		dropped_spans = droppedSpans,
+		open_stack_entries_at_end = openStackEntriesAtEnd,
+		selected_frame_event_coverage_pct = sampledFrameCoveragePct,
+		partial = #partialReasons > 0,
+		partial_reasons = partialReasons,
+		notes = if focus ~= "all" then { "focus filters events before stack aggregation; exclusive_us is exclusive within emitted focused events, not the full snapshot." } else nil,
+	}
+	_object.recommended_tools = recommendedToolsForGroups(topGroups, targetRole)
+	local result = _object
+	if (next(omitted)) ~= nil then
+		result.omitted = omitted
+	end
+	if comparisonIndex ~= nil then
+		result.comparison_index = comparisonIndex
+	end
+	result.backend = backend
+	if session:GetDataFormatVersion() ~= nil then
+		result.libmp_data_format_version = session:GetDataFormatVersion()
+	end
+	if session:GetObjSize() ~= nil then
+		result.snapshot_object_size_bytes = session:GetObjSize()
+	end
+	if includeRawBuffer then
+		result.raw_snapshot_base64 = encodeBase64(snapshot, checkpoint)
+	end
+	iterator:Dispose()
+	session:Dispose()
+	return result
+end
+return {
+	captureMicroProfiler = captureMicroProfiler,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">MultiplayerTestHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+-- Multiplayer Studio testing, ported from Chrrxs/robloxstudio-mcp (MIT).
+-- Kept out of TestHandlers so our solo playtest path stays untouched: this drives
+-- StudioTestService.ExecuteMultiplayerTestAsync, which is a different mechanism.
+local _services = TS.import(script, script.Parent.Parent.Parent, "node_modules", "@rbxts", "services")
+local HttpService = _services.HttpService
+local Players = _services.Players
+local RunService = _services.RunService
+local StudioTestService = game:GetService("StudioTestService")
+local testRunning = false
+local multiplayerState = {
+	phase = "idle",
+}
+local function detectPeerRole()
+	if not RunService:IsRunning() then
+		return "edit"
+	end
+	if RunService:IsServer() then
+		return "server"
+	end
+	return "client"
+end
+local function getPlayersSnapshot()
+	local _exp = Players:GetPlayers()
+	-- ▼ ReadonlyArray.map ▼
+	local _newValue = table.create(#_exp)
+	local _callback = function(player)
+		return {
+			name = player.Name,
+			userId = player.UserId,
+			displayName = player.DisplayName,
+		}
+	end
+	for _k, _v in _exp do
+		_newValue[_k] = _callback(_v, _k - 1, _exp)
+	end
+	-- ▲ ReadonlyArray.map ▲
+	local players = _newValue
+	table.sort(players, function(a, b)
+		return a.name < b.name
+	end)
+	return players
+end
+local function cloneMultiplayerState()
+	return {
+		phase = multiplayerState.phase,
+		testId = multiplayerState.testId,
+		numPlayers = multiplayerState.numPlayers,
+		testArgs = multiplayerState.testArgs,
+		startedAt = multiplayerState.startedAt,
+		completedAt = multiplayerState.completedAt,
+		ok = multiplayerState.ok,
+		result = multiplayerState.result,
+		error = multiplayerState.error,
+	}
+end
+local function normalizeNumPlayers(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return nil
+	end
+	local n = math.floor(value)
+	if n ~= value or n < 1 or n > 8 then
+		return nil
+	end
+	return n
+end
+local function multiplayerTestStart(requestData)
+	if RunService:IsRunning() then
+		return {
+			error = "multiplayer_test_start must be called on the edit DataModel. Route with target=edit.",
+		}
+	end
+	local numPlayers = normalizeNumPlayers(requestData.numPlayers)
+	if numPlayers == nil then
+		return {
+			error = "numPlayers must be an integer from 1 to 8",
+		}
+	end
+	if multiplayerState.phase == "starting" or multiplayerState.phase == "running" then
+		return {
+			error = "A multiplayer Studio test is already running",
+			state = cloneMultiplayerState(),
+		}
+	end
+	local testArgs = if requestData.testArgs ~= nil then requestData.testArgs else {}
+	local testId = HttpService:GenerateGUID(false)
+	multiplayerState = {
+		phase = "starting",
+		testId = testId,
+		numPlayers = numPlayers,
+		testArgs = testArgs,
+		startedAt = tick(),
+	}
+	task.spawn(function()
+		multiplayerState.phase = "running"
+		local ok, result = pcall(function()
+			return StudioTestService:ExecuteMultiplayerTestAsync(numPlayers, testArgs)
+		end)
+		multiplayerState.completedAt = tick()
+		multiplayerState.ok = ok
+		if ok then
+			multiplayerState.phase = "completed"
+			multiplayerState.result = result
+			multiplayerState.error = nil
+		else
+			multiplayerState.phase = "failed"
+			multiplayerState.result = nil
+			multiplayerState.error = tostring(result)
+		end
+	end)
+	local response = {
+		success = true,
+		message = `Multiplayer Studio test starting with {numPlayers} player(s).`,
+		testId = testId,
+		phase = multiplayerState.phase,
+		numPlayers = numPlayers,
+		testArgs = testArgs,
+	}
+	return response
+end
+local function multiplayerTestState(_requestData)
+	local peer = detectPeerRole()
+	local response = {
+		success = true,
+		peer = peer,
+		isRunning = RunService:IsRunning(),
+		isRunMode = RunService:IsRunMode(),
+		editModeActive = StudioTestService.EditModeActive,
+	}
+	if peer == "edit" then
+		response.session = cloneMultiplayerState()
+		return response
+	end
+	local argsOk, args = pcall(function()
+		return StudioTestService:GetTestArgs()
+	end)
+	response.testArgsOk = argsOk
+	response.testArgs = if argsOk then args else nil
+	if not argsOk then
+		response.testArgsError = tostring(args)
+	end
+	local players = getPlayersSnapshot()
+	response.players = players
+	response.playerCount = #players
+	if peer == "client" then
+		response.localPlayer = if Players.LocalPlayer then Players.LocalPlayer.Name else nil
+		local canLeaveOk, canLeave = pcall(function()
+			return StudioTestService:CanLeaveTest()
+		end)
+		response.canLeaveOk = canLeaveOk
+		response.canLeave = if canLeaveOk then canLeave else false
+		if not canLeaveOk then
+			response.canLeaveError = tostring(canLeave)
+		end
+	end
+	return response
+end
+local function multiplayerTestAddPlayers(requestData)
+	if not RunService:IsRunning() or not RunService:IsServer() then
+		return {
+			error = "multiplayer_test_add_players must be called on the running server peer. Route with target=server.",
+		}
+	end
+	local numPlayers = normalizeNumPlayers(requestData.numPlayers)
+	if numPlayers == nil then
+		return {
+			error = "numPlayers must be an integer from 1 to 8",
+		}
+	end
+	local before = #Players:GetPlayers()
+	local ok, result = pcall(function()
+		return StudioTestService:AddPlayers(numPlayers)
+	end)
+	if not ok then
+		return {
+			error = tostring(result),
+		}
+	end
+	local _exp = tick()
+	local _condition = (requestData.timeout)
+	if _condition == nil then
+		_condition = 10
+	end
+	local deadline = _exp + _condition
+	while #Players:GetPlayers() < before + numPlayers and tick() < deadline do
+		task.wait(0.1)
+	end
+	local players = getPlayersSnapshot()
+	return {
+		success = true,
+		message = `Requested {numPlayers} additional player(s).`,
+		playerCount = #players,
+		players = players,
+	}
+end
+local function multiplayerTestLeaveClient(_requestData)
+	if not RunService:IsRunning() or RunService:IsServer() then
+		return {
+			error = "multiplayer_test_leave_client must be called on a running client peer. Route with target=client-N.",
+		}
+	end
+	local canLeaveOk, canLeave = pcall(function()
+		return StudioTestService:CanLeaveTest()
+	end)
+	if not canLeaveOk then
+		return {
+			error = tostring(canLeave),
+			canLeaveOk = false,
+		}
+	end
+	if not canLeave then
+		return {
+			error = "This client cannot leave the current test session.",
+			canLeaveOk = true,
+			canLeave = false,
+		}
+	end
+	local localPlayer = if Players.LocalPlayer then Players.LocalPlayer.Name else nil
+	task.defer(function()
+		pcall(function()
+			return StudioTestService:LeaveTest()
+		end)
+	end)
+	return {
+		success = true,
+		message = "Client leave requested.",
+		localPlayer = localPlayer,
+	}
+end
+local function multiplayerTestEnd(requestData)
+	if not RunService:IsRunning() or not RunService:IsServer() then
+		return {
+			error = "multiplayer_test_end must be called on the running server peer. Route with target=server.",
+		}
+	end
+	local value = if requestData.value ~= nil then requestData.value else "ended_by_mcp"
+	local ok, result = pcall(function()
+		return StudioTestService:EndTest(value)
+	end)
+	if not ok then
+		return {
+			error = tostring(result),
+		}
+	end
+	return {
+		success = true,
+		message = "Multiplayer Studio test end requested.",
+		value = value,
+	}
+end
+return {
+	multiplayerTestStart = multiplayerTestStart,
+	multiplayerTestState = multiplayerTestState,
+	multiplayerTestAddPlayers = multiplayerTestAddPlayers,
+	multiplayerTestLeaveClient = multiplayerTestLeaveClient,
+	multiplayerTestEnd = multiplayerTestEnd,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="18">
           <Properties>
             <string name="Name">PropertyHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3776,7 +6399,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="15">
+        <Item class="ModuleScript" referent="19">
           <Properties>
             <string name="Name">QueryHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -4792,7 +7415,256 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="16">
+        <Item class="ModuleScript" referent="20">
+          <Properties>
+            <string name="Name">SceneAnalysisHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local MODE_CONFIGS = {
+	instance_composition = {
+		method = "GetInstanceCompositionAsync",
+		query = function(service)
+			return service:GetInstanceCompositionAsync()
+		end,
+	},
+	script_memory = {
+		method = "GetScriptMemoryAsync",
+		query = function(service)
+			return service:GetScriptMemoryAsync()
+		end,
+	},
+	unparented_instances = {
+		method = "GetUnparentedInstancesAsync",
+		query = function(service)
+			return service:GetUnparentedInstancesAsync()
+		end,
+	},
+	triangle_composition = {
+		method = "GetTriangleCompositionAsync",
+		query = function(service)
+			return service:GetTriangleCompositionAsync()
+		end,
+		sortByTriangles = true,
+	},
+	animation_memory = {
+		method = "GetAnimationMemoryAsync",
+		query = function(service)
+			return service:GetAnimationMemoryAsync()
+		end,
+	},
+	audio_memory = {
+		method = "GetAudioMemoryAsync",
+		query = function(service)
+			return service:GetAudioMemoryAsync()
+		end,
+	},
+}
+local ALL_MODES = { "instance_composition", "script_memory", "unparented_instances", "triangle_composition", "animation_memory", "audio_memory" }
+local function betaDisabledError()
+	return {
+		error = "scene_analysis_not_enabled",
+		message = "SceneAnalysisService is not enabled. Enable Scene Analysis in Studio Beta Features and restart Studio.",
+		betaFeatureRequired = true,
+	}
+end
+local function isBetaDisabledError(value)
+	local _value = value
+	local _condition = type(_value) == "string"
+	if _condition then
+		_condition = (string.find(value, "SceneAnalysisService is not enabled", 1, true)) ~= nil
+	end
+	return _condition
+end
+local function getSceneAnalysisService()
+	local provider = game
+	local ok, service = pcall(function()
+		return provider:GetService("SceneAnalysisService")
+	end)
+	if not ok or not service then
+		return {
+			error = "scene_analysis_unavailable",
+			message = `SceneAnalysisService is unavailable: {tostring(service)}`,
+		}
+	end
+	return service
+end
+local function normalizeMode(mode)
+	if mode == nil or mode == "all" then
+		return "all"
+	end
+	local _mode = mode
+	local _condition = not (type(_mode) == "string")
+	if not _condition then
+		_condition = MODE_CONFIGS[mode] == nil
+	end
+	if _condition then
+		return {
+			error = "invalid_mode",
+			message = `mode must be one of: all, {table.concat(ALL_MODES, ", ")}`,
+		}
+	end
+	return mode
+end
+local function normalizeTopN(topN)
+	local _topN = topN
+	if not (type(_topN) == "number") then
+		return 10
+	end
+	return math.clamp(math.floor(topN), 1, 100)
+end
+local function countLeaves(node)
+	local children = node.Children
+	if children and #children > 0 then
+		local total = 0
+		for _, child in children do
+			total += countLeaves(child)
+		end
+		return total
+	end
+	return 1
+end
+local function flattenLeaves(node, out)
+	local children = node.Children
+	if children and #children > 0 then
+		for _, child in children do
+			flattenLeaves(child, out)
+		end
+		return nil
+	end
+	local _out = out
+	local _node = node
+	table.insert(_out, _node)
+end
+local function compactEntry(node)
+	local entry = {
+		name = node.Name,
+	}
+	if node.Size ~= nil then
+		entry.size = node.Size
+	end
+	if node.Sizes ~= nil then
+		entry.sizes = node.Sizes
+	end
+	if node.AssetId ~= nil then
+		entry.asset_id = node.AssetId
+	end
+	return entry
+end
+local function compactRoot(node, leafCount)
+	local children = node.Children
+	local root = {
+		name = node.Name,
+		child_count = if children then #children else 0,
+		leaf_count = leafCount,
+	}
+	if node.Size ~= nil then
+		root.size = node.Size
+	end
+	if node.Sizes ~= nil then
+		root.sizes = node.Sizes
+	end
+	return root
+end
+local function metric(node, sortByTriangles)
+	if sortByTriangles then
+		local sizes = node.Sizes
+		local triangles = if sizes then sizes.Triangles else nil
+		local _condition = triangles
+		if _condition == nil then
+			_condition = 0
+		end
+		return _condition
+	end
+	local _condition = node.Size
+	if _condition == nil then
+		_condition = 0
+	end
+	return _condition
+end
+local function summarizeMode(mode, config, service, topN, raw)
+	local started = os.clock()
+	local ok, result = pcall(function()
+		return config.query(service)
+	end)
+	local elapsedMs = math.floor((os.clock() - started) * 1000)
+	if not ok then
+		if isBetaDisabledError(result) then
+			return betaDisabledError()
+		end
+		return {
+			error = "scene_analysis_query_failed",
+			mode = mode,
+			method = config.method,
+			message = tostring(result),
+		}
+	end
+	local tree = result
+	local leaves = {}
+	flattenLeaves(tree, leaves)
+	table.sort(leaves, function(a, b)
+		return metric(a, config.sortByTriangles == true) > metric(b, config.sortByTriangles == true)
+	end)
+	local top = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(topN, #leaves)) then
+				break
+			end
+			local _arg0 = compactEntry(leaves[i + 1])
+			table.insert(top, _arg0)
+		end
+	end
+	local body = {
+		mode = mode,
+		method = config.method,
+		elapsed_ms = elapsedMs,
+		root = compactRoot(tree, #leaves),
+		top = top,
+	}
+	if raw then
+		body.tree = tree
+	end
+	return body
+end
+local function getSceneAnalysis(requestData)
+	local mode = normalizeMode(requestData.mode)
+	if not (type(mode) == "string") then
+		return mode
+	end
+	local serviceOrError = getSceneAnalysisService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	local topN = normalizeTopN(requestData.topN)
+	local raw = requestData.raw == true
+	if mode ~= "all" then
+		return summarizeMode(mode, MODE_CONFIGS[mode], service, topN, raw)
+	end
+	local body = {}
+	for _, m in ALL_MODES do
+		local result = summarizeMode(m, MODE_CONFIGS[m], service, topN, raw)
+		if result.error == "scene_analysis_not_enabled" then
+			return result
+		end
+		body[m] = result
+	end
+	return body
+end
+return {
+	getSceneAnalysis = getSceneAnalysis,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="21">
           <Properties>
             <string name="Name">ScriptHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5488,7 +8360,470 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="17">
+        <Item class="ModuleScript" referent="22">
+          <Properties>
+            <string name="Name">ScriptProfilerHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local DEFAULT_DURATION_MS = 1000
+local MIN_DURATION_MS = 100
+local MAX_DURATION_MS = 15000
+local DEFAULT_FREQUENCY = 1000
+local DEFAULT_MAX_FUNCTIONS = 20
+local function getProfilerService()
+	local provider = game
+	local ok, service = pcall(function()
+		return provider:GetService("ScriptProfilerService")
+	end)
+	if not ok or not service then
+		return {
+			error = "script_profiler_unavailable",
+			message = `ScriptProfilerService is unavailable: {tostring(service)}`,
+		}
+	end
+	return service
+end
+local function normalizeDurationMs(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_DURATION_MS
+	end
+	return math.clamp(math.floor(value), MIN_DURATION_MS, MAX_DURATION_MS)
+end
+local function normalizeFrequency(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_FREQUENCY
+	end
+	return math.clamp(math.floor(value), 1, 10000)
+end
+local function normalizeMaxFunctions(value)
+	local _value = value
+	if not (type(_value) == "number") then
+		return DEFAULT_MAX_FUNCTIONS
+	end
+	return math.clamp(math.floor(value), 1, 100)
+end
+local function normalizeMinTotalUs(requestData)
+	local value = requestData.min_total_us
+	if type(value) == "number" then
+		return math.max(0, value)
+	end
+	return 0
+end
+local function stringContains(haystack, needle)
+	return (string.find(string.lower(haystack), string.lower(needle), 1, true)) ~= nil
+end
+local function localPlayer()
+	local player = Players.LocalPlayer
+	local started = tick()
+	while not player and tick() - started < 5 do
+		task.wait(0.05)
+		player = Players.LocalPlayer
+	end
+	return player
+end
+local function functionDisplayName(func)
+	local _name = func.Name
+	local _condition = type(_name) == "string"
+	if _condition then
+		_condition = func.Name ~= ""
+	end
+	if _condition then
+		return func.Name
+	end
+	local _source = func.Source
+	local _condition_1 = type(_source) == "string"
+	if _condition_1 then
+		_condition_1 = func.Source ~= ""
+	end
+	if _condition_1 then
+		local _line = func.Line
+		local _condition_2 = type(_line) == "number"
+		if _condition_2 then
+			_condition_2 = func.Line > 0
+		end
+		if _condition_2 then
+			return `{func.Source}:{func.Line}`
+		end
+		return func.Source
+	end
+	return "<anonymous>"
+end
+local function flagsOf(func)
+	local _flags = func.Flags
+	return if type(_flags) == "number" then func.Flags else 0
+end
+local function isNativeFunction(func)
+	return bit32.band(flagsOf(func), 1) ~= 0
+end
+local function isPluginFunction(func)
+	if bit32.band(flagsOf(func), 2) ~= 0 then
+		return true
+	end
+	local _source = func.Source
+	local _condition = type(_source) == "string"
+	if _condition then
+		_condition = (string.find(func.Source, "MCPPlugin", 1, true)) ~= nil
+	end
+	return _condition
+end
+local function isDebugLabel(func, filter)
+	if filter == nil then
+		return false
+	end
+	local _name = func.Name
+	local _condition = not (type(_name) == "string")
+	if not _condition then
+		_condition = func.Name == ""
+	end
+	if _condition then
+		return false
+	end
+	local _source = func.Source
+	local _condition_1 = not (type(_source) == "string")
+	if not _condition_1 then
+		_condition_1 = func.Source == "" or func.Source == "[C]" or func.Source == "GC"
+	end
+	if _condition_1 then
+		return false
+	end
+	if func.Line ~= nil and func.Line ~= 0 then
+		return false
+	end
+	if isNativeFunction(func) or isPluginFunction(func) then
+		return false
+	end
+	return stringContains(func.Name, filter) or stringContains(func.Source, filter)
+end
+local function pctOfCapture(row, durationMs)
+	local captureUs = durationMs * 1000
+	if captureUs <= 0 then
+		return nil
+	end
+	return math.floor((row.total_us / captureUs) * 10000 + 0.5) / 100
+end
+local function compactFunction(row, rank, durationMs)
+	local out = {
+		rank = rank,
+		function_index = row.function_index,
+		name = row.name,
+		total_us = math.floor(row.total_us + 0.5),
+	}
+	local pct = pctOfCapture(row, durationMs)
+	if pct ~= nil then
+		out.pct_of_capture = pct
+	end
+	if row.source ~= nil then
+		out.source = row.source
+	end
+	if row.line ~= nil then
+		out.line = row.line
+	end
+	if row.is_native == true then
+		out.is_native = true
+	end
+	if row.is_plugin == true then
+		out.is_plugin = true
+	end
+	if row.is_debug_label == true then
+		out.is_debug_label = true
+	end
+	return out
+end
+local function summarizeProfile(rawJson, profile, requestData, durationMs, frequency, eventPlayerName)
+	local _functions = profile.Functions
+	local funcs = if type(_functions) == "table" then profile.Functions else {}
+	local _nodes = profile.Nodes
+	local nodes = if type(_nodes) == "table" then profile.Nodes else {}
+	local _categories = profile.Categories
+	local categories = if type(_categories) == "table" then profile.Categories else {}
+	local maxFunctions = normalizeMaxFunctions(requestData.max_functions)
+	local minTotalUs = normalizeMinTotalUs(requestData)
+	local includeNative = requestData.include_native == true
+	local includePlugin = requestData.include_plugin == true
+	local _filter = requestData.filter
+	local _condition = type(_filter) == "string"
+	if _condition then
+		_condition = requestData.filter ~= ""
+	end
+	local filter = if _condition then requestData.filter else nil
+	local rows = {}
+	local debugRows = {}
+	local omittedNative = 0
+	local omittedPlugin = 0
+	local omittedBelowThreshold = 0
+	local omittedByFilter = 0
+	for i = 0, #funcs - 1 do
+		local func = funcs[i + 1]
+		if not (type(func) == "table") then
+			continue
+		end
+		local info = func
+		local _totalDuration = info.TotalDuration
+		local totalUs = if type(_totalDuration) == "number" then info.TotalDuration else 0
+		local name = functionDisplayName(info)
+		local _object = {
+			function_index = i + 1,
+			name = name,
+		}
+		local _left = "source"
+		local _source = info.Source
+		_object[_left] = if type(_source) == "string" then info.Source else nil
+		local _left_1 = "line"
+		local _line = info.Line
+		_object[_left_1] = if type(_line) == "number" then info.Line else nil
+		_object.total_us = totalUs
+		_object.is_native = if isNativeFunction(info) then true else nil
+		_object.is_plugin = if isPluginFunction(info) then true else nil
+		_object.is_debug_label = if isDebugLabel(info, filter) then true else nil
+		local row = _object
+		if not includeNative and row.is_native == true then
+			omittedNative += 1
+			continue
+		end
+		if not includePlugin and row.is_plugin == true then
+			omittedPlugin += 1
+			continue
+		end
+		if totalUs < minTotalUs then
+			omittedBelowThreshold += 1
+			continue
+		end
+		if filter ~= nil then
+			local _exp = row.name
+			local _condition_1 = row.source
+			if _condition_1 == nil then
+				_condition_1 = ""
+			end
+			local text = `{_exp} {_condition_1}`
+			if not stringContains(text, filter) then
+				omittedByFilter += 1
+				continue
+			end
+		end
+		table.insert(rows, row)
+		if row.is_debug_label == true then
+			table.insert(debugRows, row)
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a.total_us > b.total_us
+	end)
+	table.sort(debugRows, function(a, b)
+		return a.total_us > b.total_us
+	end)
+	local topFunctions = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxFunctions, #rows)) then
+				break
+			end
+			local _arg0 = compactFunction(rows[i + 1], i + 1, durationMs)
+			table.insert(topFunctions, _arg0)
+		end
+	end
+	local debugLabels = {}
+	do
+		local i = 0
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i < math.min(maxFunctions, #debugRows)) then
+				break
+			end
+			local _arg0 = compactFunction(debugRows[i + 1], i + 1, durationMs)
+			table.insert(debugLabels, _arg0)
+		end
+	end
+	local categoryNames = {}
+	for i = 0, #categories - 1 do
+		local category = categories[i + 1]
+		if type(category) == "table" then
+			local name = category.Name
+			if type(name) == "string" then
+				table.insert(categoryNames, name)
+			end
+		end
+	end
+	local omitted = {}
+	local hasOmitted = false
+	if omittedNative > 0 then
+		omitted.native = omittedNative
+		hasOmitted = true
+	end
+	if omittedPlugin > 0 then
+		omitted.plugin = omittedPlugin
+		hasOmitted = true
+	end
+	if omittedBelowThreshold > 0 then
+		omitted.below_min_total_us = omittedBelowThreshold
+		hasOmitted = true
+	end
+	if omittedByFilter > 0 then
+		omitted.filtered_out = omittedByFilter
+		hasOmitted = true
+	end
+	local _object = {
+		ok = true,
+		duration_ms = durationMs,
+		frequency = frequency,
+	}
+	local _left = "applied"
+	local _object_1 = {}
+	local _left_1 = "filter"
+	local _condition_1 = filter
+	if _condition_1 == nil then
+		_condition_1 = nil
+	end
+	_object_1[_left_1] = _condition_1
+	_object_1.min_total_us = minTotalUs
+	_object_1.include_native = includeNative
+	_object_1.include_plugin = includePlugin
+	_object_1.max_functions = maxFunctions
+	_object_1.sort = "total_us_desc"
+	_object[_left] = _object_1
+	_object.json_bytes = #rawJson
+	_object.counts = {
+		categories = #categories,
+		nodes = #nodes,
+		functions = #funcs,
+	}
+	_object.top_functions = topFunctions
+	_object.debug_labels = debugLabels
+	local result = _object
+	if #categoryNames > 0 then
+		result.categories = categoryNames
+	end
+	if hasOmitted then
+		result.omitted = omitted
+	end
+	if profile.Version ~= nil then
+		result.version = profile.Version
+	end
+	if profile.SessionStartTime ~= nil or profile.SessionEndTime ~= nil then
+		result.session = {
+			start_time = profile.SessionStartTime,
+			end_time = profile.SessionEndTime,
+		}
+	end
+	if eventPlayerName ~= nil then
+		result.player = eventPlayerName
+	end
+	if requestData.__mcp_include_raw_json == true then
+		result.raw_json = rawJson
+	end
+	return result
+end
+local function captureScriptProfiler(requestData)
+	if not RunService:IsRunning() then
+		return {
+			error = "runtime_target_required",
+			message = 'Script profiler capture requires a running playtest target such as target=\"server\" or target=\"client-1\".',
+		}
+	end
+	local serviceOrError = getProfilerService()
+	local _value = serviceOrError.IsA
+	if not (_value ~= 0 and _value == _value and _value ~= "" and _value) then
+		return serviceOrError
+	end
+	local service = serviceOrError
+	local durationMs = normalizeDurationMs(requestData.duration_ms)
+	local frequency = normalizeFrequency(requestData.frequency)
+	local isServer = RunService:IsServer()
+	local isClient = RunService:IsClient() and not isServer
+	local player = if isClient then localPlayer() else nil
+	if not isServer and not player then
+		return {
+			error = "client_player_unavailable",
+			message = "Could not resolve Players.LocalPlayer for client profiling.",
+		}
+	end
+	local rawJson
+	local eventPlayerName
+	local connection = service.OnNewData:Connect(function(playerArg, jsonString)
+		if rawJson ~= nil then
+			return nil
+		end
+		rawJson = jsonString
+		if playerArg then
+			eventPlayerName = playerArg.Name
+		end
+	end)
+	local startOk, startErr = pcall(function()
+		if isServer then
+			service:ServerStart(frequency)
+		else
+			service:ClientStart(player, frequency)
+		end
+	end)
+	if not startOk then
+		connection:Disconnect()
+		return {
+			error = "script_profiler_start_failed",
+			message = tostring(startErr),
+		}
+	end
+	task.wait(durationMs / 1000)
+	local stopOk, stopErr = pcall(function()
+		if isServer then
+			service:ServerStop()
+			service:ServerRequestData()
+		else
+			service:ClientStop(player)
+			service:ClientRequestData(player)
+		end
+	end)
+	if not stopOk then
+		connection:Disconnect()
+		return {
+			error = "script_profiler_stop_failed",
+			message = tostring(stopErr),
+		}
+	end
+	local requestedAt = tick()
+	while rawJson == nil and tick() - requestedAt < 5 do
+		task.wait(0.05)
+	end
+	connection:Disconnect()
+	if rawJson == nil then
+		return {
+			error = "script_profiler_data_timeout",
+			message = "ScriptProfilerService did not emit OnNewData after requesting profiler data.",
+		}
+	end
+	local decodeOk, decoded = pcall(function()
+		return HttpService:JSONDecode(rawJson)
+	end)
+	if not decodeOk then
+		return {
+			error = "script_profiler_decode_failed",
+			message = tostring(decoded),
+			json_bytes = #rawJson,
+		}
+	end
+	return summarizeProfile(rawJson, decoded, requestData, durationMs, frequency, eventPlayerName)
+end
+return {
+	captureScriptProfiler = captureScriptProfiler,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="23">
           <Properties>
             <string name="Name">SelectionHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5674,7 +9009,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="18">
+        <Item class="ModuleScript" referent="24">
           <Properties>
             <string name="Name">SerializationHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5860,7 +9195,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="19">
+        <Item class="ModuleScript" referent="25">
           <Properties>
             <string name="Name">TestHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6175,7 +9510,7 @@ return {
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="26">
         <Properties>
           <string name="Name">LuauExec</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6609,7 +9944,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">Recording</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6639,7 +9974,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">RuntimeLogBuffer</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6894,7 +10229,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">State</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6990,7 +10325,305 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
+      <Item class="ModuleScript" referent="30">
+        <Properties>
+          <string name="Name">StopPlayMonitor</string>
+          <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.include.RuntimeLib)
+-- Cross-DM stop_playtest signaling via plugin:SetSetting, scoped by
+-- per-instance setting key so the same Studio process can host playtests
+-- for multiple places without one place's stop_playtest yanking another's.
+-- During publish-after-connect, both "anon:<uuid>" and "place:<PlaceId>"
+-- can refer to the same Studio place, so stop requests are mirrored across
+-- both keys while the monitor waits for a matching result on either key.
+--
+-- `plugin:SetSetting` / `plugin:GetSetting` is a per-plugin persistent store
+-- shared across every DataModel the plugin runs in (edit DMs, play-server
+-- DMs, play-client DMs). For each connected place we use a dedicated key
+-- "MCP_STOP_PLAY_<instanceId>" as a tiny request/result mailbox:
+--
+--   * The edit DM's handler writes a tokenized stop request into its own key
+--     (computed from its placeId / ServerStorage anon UUID).
+--   * Each play-server DM's monitor loop polls the key matching its own
+--     instanceId at 1Hz. On a fresh token, it calls StudioTestService:EndTest
+--     and writes a matching result token. Play-server DMs for other places
+--     never touch this key.
+--   * The edit DM waits up to ~8s for its result token, confirming a matching
+--     play-server actually consumed the request.
+--
+-- Earlier versions used a single shared boolean flag, which let any
+-- play-server DM in the same Studio process consume any place's stop
+-- request — silently yanking teammates' playtests. The per-key scoping
+-- below is the fix.
+local _services = TS.import(script, script.Parent.Parent, "node_modules", "@rbxts", "services")
+local HttpService = _services.HttpService
+local RunService = _services.RunService
+local ServerStorage = _services.ServerStorage
+local StudioTestService = game:GetService("StudioTestService")
+local SETTING_KEY_PREFIX = "MCP_STOP_PLAY_"
+-- Keep this conservative. plugin:GetSetting is backed by Studio's plugin
+-- settings store, and this monitor runs during every play session, including
+-- manually-started Play. The official reference implementation polls at 1s.
+local POLL_INTERVAL_SEC = 1
+-- Total time we wait for the matching play-server DM to consume the
+-- signal. Must cover: monitor detection (<= POLL_INTERVAL_SEC) +
+-- StudioTestService:EndTest teardown (several seconds on heavier places).
+-- 8s is intentionally shorter than the MCP request timeout but long enough
+-- for the 1s monitor cadence plus ordinary Studio teardown latency.
+local WAIT_FOR_CONSUMPTION_TIMEOUT_SEC = 8.0
+local WAIT_POLL_SEC = 0.1
+local REQUEST_TTL_SEC = 12.0
+local pluginRef
+local endTestIssued = false
+local function init(p)
+	pluginRef = p
+end
+-- Mirror of Communication.computeInstanceId(). Duplicated here because
+-- StopPlayMonitor runs in both edit and play-server DMs, and both must
+-- agree on the place identifier (published places: placeId; unpublished:
+-- UUID on ServerStorage's __MCPPlaceId attribute, travels with the .rbxl
+-- into the play DM).
+local function addUnique(values, value)
+	local _values = values
+	local _value = value
+	if not (table.find(_values, _value) ~= nil) then
+		local _values_1 = values
+		local _value_1 = value
+		table.insert(_values_1, _value_1)
+	end
+end
+local function computeInstanceIds()
+	local ids = {}
+	if game.PlaceId ~= 0 then
+		addUnique(ids, `place:{tostring(game.PlaceId)}`)
+	end
+	local existing = ServerStorage:GetAttribute("__MCPPlaceId")
+	if type(existing) == "string" and existing ~= "" then
+		addUnique(ids, `anon:{existing}`)
+	elseif game.PlaceId == 0 then
+		local fresh = HttpService:GenerateGUID(false)
+		pcall(function()
+			return ServerStorage:SetAttribute("__MCPPlaceId", fresh)
+		end)
+		addUnique(ids, `anon:{fresh}`)
+	end
+	return ids
+end
+local function settingKey(instanceId)
+	return SETTING_KEY_PREFIX .. instanceId
+end
+local function settingKeys()
+	local _exp = computeInstanceIds()
+	-- ▼ ReadonlyArray.map ▼
+	local _newValue = table.create(#_exp)
+	local _callback = function(instanceId)
+		return settingKey(instanceId)
+	end
+	for _k, _v in _exp do
+		_newValue[_k] = _callback(_v, _k - 1, _exp)
+	end
+	-- ▲ ReadonlyArray.map ▲
+	return _newValue
+end
+local function readSetting(key)
+	if not pluginRef then
+		return nil
+	end
+	local ok, value = pcall(function()
+		return pluginRef:GetSetting(key)
+	end)
+	return if ok then value else nil
+end
+local function writeSetting(key, value)
+	if not pluginRef then
+		return false
+	end
+	local ok = pcall(function()
+		return pluginRef:SetSetting(key, value)
+	end)
+	return ok
+end
+local function decodePayload(value)
+	local decoded = value
+	local _value = value
+	if type(_value) == "string" then
+		local ok, result = pcall(function()
+			return HttpService:JSONDecode(value)
+		end)
+		if not ok then
+			return nil
+		end
+		decoded = result
+	end
+	local _decoded = decoded
+	if not (type(_decoded) == "table") then
+		return nil
+	end
+	local payload = decoded
+	local _kind = payload.kind
+	local _condition = not (type(_kind) == "string")
+	if not _condition then
+		local _id = payload.id
+		_condition = not (type(_id) == "string")
+	end
+	if _condition then
+		return nil
+	end
+	return payload
+end
+local function writePayload(key, payload)
+	local encodedOk, encoded = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not encodedOk or not (type(encoded) == "string") then
+		return false
+	end
+	return writeSetting(key, encoded)
+end
+local function writeResult(key, request, ok, errText)
+	writePayload(key, {
+		kind = "result",
+		id = request.id,
+		requestedAt = request.requestedAt,
+		consumedAt = tick(),
+		ok = ok,
+		error = errText,
+	})
+end
+local function handleStopRequest(key, request)
+	local _condition = request.kind ~= "request"
+	if not _condition then
+		local _id = request.id
+		_condition = not (type(_id) == "string")
+	end
+	if _condition then
+		return nil
+	end
+	local _requestedAt = request.requestedAt
+	if not (type(_requestedAt) == "number") then
+		writeSetting(key, false)
+		return nil
+	end
+	local age = tick() - request.requestedAt
+	if age < -5 or age > REQUEST_TTL_SEC then
+		writeSetting(key, false)
+		return nil
+	end
+	if endTestIssued then
+		writeResult(key, request, false, "StudioTestService:EndTest was already issued for this play session, but the runtime DataModel is still alive.")
+		return nil
+	end
+	if not RunService:IsRunning() or not RunService:IsServer() then
+		writeResult(key, request, false, "StopPlayMonitor is not running in the server DataModel.")
+		return nil
+	end
+	endTestIssued = true
+	local endOk, endErr = pcall(function()
+		return StudioTestService:EndTest("stopped_by_mcp")
+	end)
+	writeResult(key, request, endOk, if endOk then nil else tostring(endErr))
+	if not endOk then
+		endTestIssued = false
+	end
+end
+local function startMonitor()
+	if not pluginRef then
+		warn("[robloxstudio-mcp] StopPlayMonitor.startMonitor called before init; skipping")
+		return nil
+	end
+	task.spawn(function()
+		while true do
+			for _, myKey in settingKeys() do
+				local value = readSetting(myKey)
+				if value == true then
+					-- Legacy boolean requests are ambiguous and may be stale from
+					-- a prior crashed session. New stop requests use token payloads.
+					writeSetting(myKey, false)
+				else
+					local payload = decodePayload(value)
+					if payload then
+						handleStopRequest(myKey, payload)
+					end
+				end
+			end
+			task.wait(POLL_INTERVAL_SEC)
+		end
+	end)
+end
+local function requestStop()
+	if not pluginRef then
+		return {
+			ok = false,
+		}
+	end
+	local requestId = HttpService:GenerateGUID(false)
+	local payload = {
+		kind = "request",
+		id = requestId,
+		requestedAt = tick(),
+	}
+	local ok = false
+	for _, myKey in settingKeys() do
+		ok = writePayload(myKey, payload) or ok
+	end
+	return {
+		ok = ok,
+		requestId = if ok then requestId else nil,
+	}
+end
+local function waitForConsumption(requestId)
+	if not pluginRef then
+		return {
+			ok = false,
+			consumed = false,
+			error = "Plugin reference is not initialized.",
+		}
+	end
+	local start = tick()
+	while tick() - start < WAIT_FOR_CONSUMPTION_TIMEOUT_SEC do
+		for _, myKey in settingKeys() do
+			local payload = decodePayload(readSetting(myKey))
+			if payload and payload.kind == "result" and payload.id == requestId then
+				return {
+					ok = payload.ok == true,
+					consumed = true,
+					error = payload.error,
+				}
+			end
+		end
+		task.wait(WAIT_POLL_SEC)
+	end
+	return {
+		ok = false,
+		consumed = false,
+		error = "Timed out waiting for the play-server DataModel to acknowledge stop_playtest.",
+	}
+end
+local function clearPending(requestId)
+	if not pluginRef then
+		return nil
+	end
+	for _, myKey in settingKeys() do
+		if requestId ~= nil then
+			local payload = decodePayload(readSetting(myKey))
+			if payload and payload.id ~= requestId then
+				continue
+			end
+		end
+		writeSetting(myKey, false)
+	end
+end
+return {
+	init = init,
+	startMonitor = startMonitor,
+	requestStop = requestStop,
+	waitForConsumption = waitForConsumption,
+	clearPending = clearPending,
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">UI</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -7710,7 +11343,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="25">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">Utils</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -8247,11 +11880,11 @@ return {
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="29">
+    <Item class="Folder" referent="36">
       <Properties>
         <string name="Name">include</string>
       </Properties>
-      <Item class="ModuleScript" referent="26">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">Promise</string>
           <string name="Source"><![CDATA[--[[
@@ -10325,7 +13958,7 @@ return Promise
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">RuntimeLib</string>
           <string name="Source"><![CDATA[local Promise = require(script.Parent.Promise)
@@ -10592,15 +14225,15 @@ return TS
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="30">
+    <Item class="Folder" referent="37">
       <Properties>
         <string name="Name">node_modules</string>
       </Properties>
-      <Item class="Folder" referent="31">
+      <Item class="Folder" referent="38">
         <Properties>
           <string name="Name">@rbxts</string>
         </Properties>
-      <Item class="ModuleScript" referent="28">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">services</string>
           <string name="Source"><![CDATA[return setmetatable({}, {

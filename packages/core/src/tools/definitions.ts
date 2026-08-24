@@ -2113,6 +2113,451 @@ part(0,2,0,2,1,1,"b")`,
   },
 
 
+
+
+
+  // === Studio process management (schema ported verbatim from Chrrxs/robloxstudio-mcp, MIT) ===
+  {
+    name: 'manage_instance',
+    category: 'write',
+    description: 'Use to manage Studio processes or list place revisions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['launch', 'authorize', 'complete', 'close', 'status', 'list_place_versions'],
+          description: 'Operation; authorize and complete only resume identity launches.'
+        },
+        source: {
+          type: 'string',
+          enum: ['baseplate', 'local_file', 'published_place', 'place_revision'],
+          description: 'Launch source; local_file needs path, published needs place_id.'
+        },
+        local_place_file: {
+          type: 'string',
+          description: '.rbxl or .rbxlx path; required for local_file.'
+        },
+        place_id: {
+          type: 'number',
+          description: 'Place ID; required for published sources and version listing.'
+        },
+        place_version: {
+          type: 'number',
+          description: 'Revision number; required for place_revision.'
+        },
+        require_process_identity: {
+          type: 'boolean',
+          description: 'Require PID attestation and explicit authorization.'
+        },
+        wait_for_connection: {
+          type: 'boolean',
+          description: 'Wait for instance_id; false returns launch_id.'
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Plugin timeout in ms; default 120000; ignored in identity mode.'
+        },
+        studio_executable: {
+          type: 'string',
+          description: 'Exact Studio executable for launch; otherwise auto-discovered.'
+        },
+        studio_working_directory: {
+          type: 'string',
+          description: 'Studio process working directory; isolates relative plugin folders per launch.'
+        },
+        process_environment: {
+          type: 'object',
+          description: 'Launch-only environment changes; never stored.',
+          properties: {
+            set: {
+              type: 'object',
+              description: 'Environment variables to set.',
+              propertyNames: {
+                pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+              },
+              additionalProperties: {
+                type: 'string'
+              }
+            },
+            remove: {
+              type: 'array',
+              description: 'Environment variables to remove.',
+              items: {
+                type: 'string',
+                pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+              }
+            }
+          },
+          additionalProperties: false
+        },
+        max_page_size: {
+          type: 'number',
+          description: 'Versions per page; clamped to 1-50, default 10.'
+        },
+        page_token: {
+          type: 'string',
+          description: 'Prior list_place_versions page token.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected instance for close or status; excludes launch_id.'
+        },
+        launch_id: {
+          type: 'string',
+          description: 'Launch for close or status; excludes instance_id.'
+        }
+      },
+      required: ['action']
+    }
+  },
+
+  // === Playtest control (schemas ported verbatim from Chrrxs/robloxstudio-mcp, MIT) ===
+  {
+    name: 'solo_playtest',
+    category: 'write',
+    description: 'Use to start, stop, or inspect a single-player Studio playtest.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'stop', 'status'],
+          description: 'Lifecycle action to run.'
+        },
+        mode: {
+          type: 'string',
+          enum: ['play', 'run'],
+          description: 'Required for action="start".'
+        },
+        timeout: {
+          type: 'number',
+          description: 'Wait in seconds; start defaults to 60 and stop to 15.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'multiplayer_playtest',
+    category: 'write',
+    description: 'Use to run or inspect a multi-client Studio playtest.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'status', 'add_players', 'leave_client', 'end'],
+          description: 'Lifecycle action to run.'
+        },
+        numPlayers: {
+          type: 'number',
+          description: 'Client count for start or add_players; 1-8.'
+        },
+        target: {
+          type: 'string',
+          description: 'Client for leave_client; defaults to client-1.'
+        },
+        testArgs: {
+          description: 'JSON value exposed through GetTestArgs on server and clients.'
+        },
+        value: {
+          description: 'JSON value returned by end to the edit process.'
+        },
+        timeout: {
+          type: 'number',
+          description: 'Wait in seconds; defaults to 30.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      },
+      required: ['action']
+    }
+  },
+
+  // === Device and network simulation (schemas ported verbatim from Chrrxs/robloxstudio-mcp, MIT) ===
+  {
+    name: 'set_device_simulator',
+    category: 'write',
+    description: 'Use to manage device simulation in edit or a playtest client.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'Edit, client-N, or all-clients; defaults to edit.'
+        },
+        deviceId: {
+          type: 'string',
+          description: 'Built-in device preset ID.'
+        },
+        orientation: {
+          type: 'string',
+          description: 'ScreenOrientation enum name.'
+        },
+        resolution: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            width: {
+              type: 'number',
+              description: 'Viewport width in pixels.'
+            },
+            height: {
+              type: 'number',
+              description: 'Viewport height in pixels.'
+            }
+          },
+          required: ['width', 'height'],
+          description: 'Resolution override after the preset.'
+        },
+        pixelDensity: {
+          type: 'number',
+          description: 'Positive density override after the preset.'
+        },
+        scalingMode: {
+          type: 'string',
+          description: 'DeviceSimulatorScalingMode enum name.'
+        },
+        stopSimulation: {
+          type: 'boolean',
+          description: 'Stop simulation; excludes other simulator settings.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_device_simulator_state',
+    category: 'read',
+    description: 'Use to inspect device simulation or list device presets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'Edit or client peer; defaults to edit. Servers are invalid.'
+        },
+        deviceId: {
+          type: 'string',
+          description: 'Built-in preset to inspect.'
+        },
+        includeDeviceList: {
+          type: 'boolean',
+          description: 'Include built-in presets; defaults to true.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'capture_device_matrix',
+    category: 'write',
+    description: 'Use to compare viewport screenshots across up to six device settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entries: {
+          type: 'array',
+          maxItems: 6,
+          description: 'Ordered device settings to capture.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              label: {
+                type: 'string',
+                description: 'Screenshot metadata label.'
+              },
+              deviceId: {
+                type: 'string',
+                description: 'Built-in device preset ID.'
+              },
+              orientation: {
+                type: 'string',
+                description: 'ScreenOrientation enum name.'
+              },
+              resolution: {
+                type: 'object',
+                additionalProperties: false,
+                description: 'Viewport override for this capture.',
+                properties: {
+                  width: {
+                    type: 'number',
+                    description: 'Viewport width in pixels.'
+                  },
+                  height: {
+                    type: 'number',
+                    description: 'Viewport height in pixels.'
+                  }
+                },
+                required: ['width', 'height']
+              },
+              pixelDensity: {
+                type: 'number',
+                description: 'Positive density override.'
+              },
+              scalingMode: {
+                type: 'string',
+                description: 'DeviceSimulatorScalingMode enum name.'
+              }
+            }
+          }
+        },
+        target: {
+          type: 'string',
+          description: 'Edit or one client-N; not server or all-clients.'
+        },
+        format: {
+          type: 'string',
+          enum: ['jpeg', 'png'],
+          description: 'Image format; defaults to jpeg. png is lossless.'
+        },
+        quality: {
+          type: 'number',
+          description: 'JPEG quality 1-100; defaults to 92. Ignored for png.'
+        },
+        settleSeconds: {
+          type: 'number',
+          description: 'Delay per capture in seconds; defaults to 0.3.'
+        },
+        restoreAfter: {
+          type: 'boolean',
+          description: 'Restore a preset afterward; custom devices cannot be restored.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      },
+      required: ['entries']
+    }
+  },
+  {
+    name: 'set_network_profile',
+    category: 'write',
+    description: 'Use to simulate client latency, jitter, or packet loss.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        profile: {
+          type: 'string',
+          enum: ['great', 'good', 'poor', 'custom'],
+          description: 'Network preset; custom requires overrides.'
+        },
+        target: {
+          type: 'string',
+          description: 'Client peer or all-clients; defaults to client-1.'
+        },
+        overrides: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            InboundNetworkMinDelayMs: {
+              type: 'number',
+              minimum: 0,
+              description: 'Server-to-client minimum delay in ms.'
+            },
+            OutboundNetworkMinDelayMs: {
+              type: 'number',
+              minimum: 0,
+              description: 'Client-to-server minimum delay in ms.'
+            },
+            InboundNetworkJitterMs: {
+              type: 'number',
+              minimum: 0,
+              description: 'Server-to-client jitter in ms.'
+            },
+            OutboundNetworkJitterMs: {
+              type: 'number',
+              minimum: 0,
+              description: 'Client-to-server jitter in ms.'
+            },
+            InboundNetworkLossPercent: {
+              type: 'number',
+              minimum: 0,
+              maximum: 0.5,
+              description: 'Server-to-client packet loss percent.'
+            },
+            OutboundNetworkLossPercent: {
+              type: 'number',
+              minimum: 0,
+              maximum: 0.5,
+              description: 'Client-to-server packet loss percent.'
+            }
+          },
+          description: 'NetworkSettings fields that override or define the profile.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      },
+      required: ['profile']
+    }
+  },
+  {
+    name: 'get_simulation_state',
+    category: 'read',
+    description: 'Use to inspect current network and device simulation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include: {
+          type: 'string',
+          enum: ['network', 'deviceSimulator', 'both'],
+          description: 'State group; defaults to both.'
+        },
+        target: {
+          type: 'string',
+          description: 'Edit or client scope; servers are invalid.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'reset_simulation_state',
+    category: 'write',
+    description: 'Use to clear network and device simulation state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'Edit or client scope; servers are invalid.'
+        },
+        network: {
+          type: 'boolean',
+          description: 'Reset network simulation; defaults to true.'
+        },
+        deviceSimulator: {
+          type: 'boolean',
+          description: 'Stop device simulation; defaults to true.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+
   // === Profiling, memory and breakpoints (schemas ported verbatim from Chrrxs/robloxstudio-mcp, MIT, so they match the handlers) ===
   {
     name: 'capture_script_profiler',

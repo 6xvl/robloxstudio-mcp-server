@@ -103,6 +103,19 @@ export interface AssetOperationResponse {
   };
 }
 
+export interface AssetVersionInfo {
+  path: string;
+  createTime?: string;
+  moderationResult?: {
+    moderationState?: string;
+  };
+}
+
+export interface AssetVersionsResponse {
+  assetVersions: AssetVersionInfo[];
+  nextPageToken?: string;
+}
+
 export class OpenCloudClient {
   private apiKey: string;
   private baseUrl: string;
@@ -207,6 +220,20 @@ export class OpenCloudClient {
         userId: params.userId,
         groupId: params.groupId,
       },
+    });
+  }
+
+  /**
+   * Published revisions of an asset, newest first. A place is an asset, so this is what
+   * lists the versions manage_instance can reopen. Ported from Chrrxs/robloxstudio-mcp (MIT).
+   */
+  async listAssetVersions(
+    assetId: number | string,
+    maxPageSize = 10,
+    pageToken?: string,
+  ): Promise<AssetVersionsResponse> {
+    return this.request<AssetVersionsResponse>(`/assets/v1/assets/${assetId}/versions`, {
+      params: { maxPageSize, pageToken },
     });
   }
 

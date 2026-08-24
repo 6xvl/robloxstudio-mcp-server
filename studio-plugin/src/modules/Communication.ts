@@ -22,6 +22,7 @@ import MicroProfilerHandlers from "./handlers/MicroProfilerHandlers";
 import MemoryHandlers from "./handlers/MemoryHandlers";
 import SceneAnalysisHandlers from "./handlers/SceneAnalysisHandlers";
 import BreakpointHandlers from "./handlers/BreakpointHandlers";
+import MultiplayerTestHandlers from "./handlers/MultiplayerTestHandlers";
 import { Connection, RequestPayload, PollResponse, ReadyResponse } from "../types";
 
 const instanceId = HttpService.GenerateGUID(false);
@@ -94,6 +95,11 @@ const routeMap: Record<string, Handler> = {
 	"/api/get-memory-breakdown": MemoryHandlers.getMemoryBreakdown,
 	"/api/get-scene-analysis": SceneAnalysisHandlers.getSceneAnalysis,
 	"/api/breakpoints": BreakpointHandlers.breakpoints,
+	"/api/multiplayer-test-start": MultiplayerTestHandlers.multiplayerTestStart,
+	"/api/multiplayer-test-state": MultiplayerTestHandlers.multiplayerTestState,
+	"/api/multiplayer-test-add-players": MultiplayerTestHandlers.multiplayerTestAddPlayers,
+	"/api/multiplayer-test-leave-client": MultiplayerTestHandlers.multiplayerTestLeaveClient,
+	"/api/multiplayer-test-end": MultiplayerTestHandlers.multiplayerTestEnd,
 	"/api/undo": MetadataHandlers.undo,
 	"/api/redo": MetadataHandlers.redo,
 	"/api/bulk-set-attributes": MetadataHandlers.bulkSetAttributes,

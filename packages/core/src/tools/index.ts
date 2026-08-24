@@ -6,6 +6,17 @@ import { RobloxCookieClient } from '../roblox-cookie-client.js';
 import { rgbaToPng } from '../png-encoder.js';
 import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
 import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
+import { StudioInstanceManager } from '../studio-instance-manager.js';
+import {
+  MAX_DEVICE_MATRIX_ENTRIES,
+  SIMULATION_PERSISTENCE_NOTES,
+  buildDeviceSimulatorLuau,
+  buildNetworkProfileLuau,
+  buildNetworkStateLuau,
+  hasDeviceSimulatorSettings,
+  normalizeDeviceSimulatorSettings,
+  normalizeNetworkProfile,
+} from '../simulation-luau.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -2009,6 +2020,381 @@ export class RobloxStudioTools {
       }
     }
     return { content: [{ type: 'text', text: JSON.stringify({ peers: results }) }] };
+  }
+
+  // --- Studio process management -----------------------------------------------
+
+  private studioInstances = new StudioInstanceManager();
+
+  private managedStatus(record: any): Record<string, unknown> {
+    return {
+      launch_id: record.launchId,
+      instance_id: record.instanceId,
+      state: record.state,
+      source: record.source,
+      place_id: record.placeId,
+      place_version: record.placeVersion,
+      local_place_file: record.localPlaceFile,
+      pid: record.pid,
+      launched_at: record.launchedAt,
+      closed_at: record.closedAt,
+      failure_reason: record.failureReason,
+    };
+  }
+
+  private positiveInteger(value: unknown, name: string): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
+      throw new Error(`${name} must be a positive integer`);
+    }
+    return value;
+  }
+
+  /**
+   * A place id is not a universe id, and the launch URI wants the universe. One lookup,
+   * public endpoint, no key needed.
+   */
+  private async deriveUniverseId(placeId: number): Promise<number> {
+    const response = await fetch(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`);
+    if (!response.ok) {
+      throw new Error(`Could not resolve the universe for place_id ${placeId} (${response.status}): ${await response.text().catch(() => '')}`);
+    }
+    const data = await response.json() as { universeId?: number };
+    if (typeof data.universeId !== 'number' || !Number.isFinite(data.universeId)) {
+      throw new Error(`Could not resolve the universe for place_id ${placeId}.`);
+    }
+    return Math.trunc(data.universeId);
+  }
+
+  /**
+   * Launch, authorize, close, inspect a Studio process, or list a place's revisions.
+   *
+   * The one tool here that reaches outside the plugin entirely: it starts and stops Studio
+   * itself, which is how you open a place that is not already open. Ported from
+   * Chrrxs/robloxstudio-mcp (MIT) and adapted to this bridge.
+   */
+  async manageInstance(request: Record<string, unknown>) {
+    const action = request.action;
+    const instanceId = typeof request.instance_id === 'string' ? request.instance_id : undefined;
+    const launchId = typeof request.launch_id === 'string' ? request.launch_id : undefined;
+
+    if (instanceId && launchId) {
+      throw new Error('manage_instance accepts only one of instance_id or launch_id.');
+    }
+    const actions = ['launch', 'authorize', 'complete', 'close', 'status', 'list_place_versions'];
+    if (typeof action !== 'string' || !actions.includes(action)) {
+      throw new Error(`manage_instance requires action=${actions.join('|')}`);
+    }
+
+    if (action === 'list_place_versions') {
+      if (!this.openCloudClient.hasApiKey()) {
+        return this.jsonResult({ error: 'ROBLOX_OPEN_CLOUD_API_KEY is required to list place versions.' });
+      }
+      const placeId = this.positiveInteger(request.place_id, 'place_id');
+      const rawSize = Math.trunc(typeof request.max_page_size === 'number' ? request.max_page_size : 10);
+      const maxPageSize = Math.max(1, Math.min(50, rawSize));
+      const pageToken = typeof request.page_token === 'string' ? request.page_token : undefined;
+      const response = await this.openCloudClient.listAssetVersions(placeId, maxPageSize, pageToken);
+      const body: Record<string, unknown> = {
+        versions: (response.assetVersions ?? []).map((version) => ({
+          // The API returns "assets/123/versions/7"; the trailing number is the revision.
+          version: Number(version.path.split('/').pop()) || undefined,
+          created_at: version.createTime,
+          path: version.path,
+          moderation_state: version.moderationResult?.moderationState,
+        })),
+      };
+      if (response.nextPageToken) body.next_page_token = response.nextPageToken;
+      return this.jsonResult(body);
+    }
+
+    if (action === 'authorize') {
+      if (!launchId) throw new Error('manage_instance action=authorize requires launch_id.');
+      return this.jsonResult(this.managedStatus(await this.studioInstances.authorizeByLaunchId(launchId)));
+    }
+
+    if (action === 'complete') {
+      if (!launchId) throw new Error('manage_instance action=complete requires launch_id.');
+      return this.jsonResult(this.managedStatus(await this.studioInstances.completeByLaunchId(launchId)));
+    }
+
+    if (action === 'status') {
+      if (launchId) {
+        const record = await this.studioInstances.getByLaunchId(launchId);
+        if (!record) return this.jsonResult({ error: 'Launch is not managed.', launch_id: launchId });
+        return this.jsonResult(this.managedStatus(record));
+      }
+      const connected = this.bridge.getInstances();
+      if (instanceId) {
+        const record = await this.studioInstances.get(instanceId);
+        const mine = connected.filter((i) => i.instanceId === instanceId);
+        if (!record && mine.length === 0) {
+          return this.jsonResult({ error: 'Instance is not connected or managed.', instance_id: instanceId });
+        }
+        return this.jsonResult({
+          ...(record ? this.managedStatus(record) : { instance_id: instanceId }),
+          connected: mine.length > 0,
+          roles: mine.map((i) => i.role).sort(),
+        });
+      }
+      return this.jsonResult({
+        managed: (await this.studioInstances.list())
+          .filter((r: any) => r.closedAt === undefined)
+          .map((r: any) => this.managedStatus(r)),
+        connected: connected.map((i) => ({ instance_id: i.instanceId, role: i.role })),
+      });
+    }
+
+    if (action === 'close') {
+      let record: any;
+      if (launchId) {
+        record = await this.studioInstances.getByLaunchId(launchId);
+        if (!record) return this.jsonResult({ error: 'Launch is not managed.', launch_id: launchId });
+      } else if (instanceId) {
+        record = await this.studioInstances.get(instanceId);
+        if (!record) return this.jsonResult({ error: 'Instance is not managed.', instance_id: instanceId });
+      } else {
+        const active = (await this.studioInstances.list()).filter((r: any) => r.closedAt === undefined);
+        if (active.length === 0) return this.jsonResult({ message: 'No managed Studio instances are active.' });
+        // Refused rather than guessed: closing the wrong Studio loses unsaved work.
+        if (active.length > 1) {
+          return this.jsonResult({
+            error: 'instance_id or launch_id is required because several managed Studio instances are active.',
+            managed: active.map((r: any) => this.managedStatus(r)),
+          });
+        }
+        record = active[0];
+      }
+
+      const closeResult = record.closedAt === undefined
+        ? await this.studioInstances.close(record)
+        : { status: 'already_closed' as const };
+      if (record.instanceId) this.bridge.unregisterInstance(record.instanceId);
+      return this.jsonResult({
+        ...this.managedStatus(record),
+        close_status: closeResult.status,
+        message: closeResult.status === 'already_closed' ? 'Studio instance was already closed.' : 'Studio instance closed.',
+      });
+    }
+
+    // launch
+    const source = request.source;
+    const sources = ['baseplate', 'local_file', 'published_place', 'place_revision'];
+    if (typeof source !== 'string' || !sources.includes(source)) {
+      throw new Error(`manage_instance action=launch requires source=${sources.join('|')}`);
+    }
+    const placeId = source === 'published_place' || source === 'place_revision'
+      ? this.positiveInteger(request.place_id, 'place_id') : undefined;
+    const placeVersion = source === 'place_revision'
+      ? this.positiveInteger(request.place_version, 'place_version') : undefined;
+
+    const requireProcessIdentity = request.require_process_identity === true;
+    const waitForConnection = !requireProcessIdentity && request.wait_for_connection !== false;
+    const timeoutMs = typeof request.timeout_ms === 'number' ? request.timeout_ms : 120000;
+
+    const before = new Set(this.bridge.getInstances().map((i) => i.instanceId));
+    const record: any = await this.studioInstances.launch({
+      source: source as any,
+      localPlaceFile: typeof request.local_place_file === 'string' ? request.local_place_file : undefined,
+      placeId,
+      universeId: placeId !== undefined ? await this.deriveUniverseId(placeId) : undefined,
+      placeVersion,
+      connectionTimeoutMs: timeoutMs,
+      studioExecutable: typeof request.studio_executable === 'string' ? request.studio_executable : undefined,
+      studioWorkingDirectory: typeof request.studio_working_directory === 'string' ? request.studio_working_directory : undefined,
+      ...(requireProcessIdentity ? { requireProcessIdentity: true } : {}),
+    });
+
+    if (!waitForConnection) {
+      return this.jsonResult({ ...this.managedStatus(record), message: 'Studio launch requested.' });
+    }
+
+    // Studio takes a while to boot and load the plugin, so the launch is not done until a
+    // NEW peer appears. Polling rather than an event because the bridge has no hook here
+    // and a launch is a once-per-minute action, not a hot path.
+    const deadline = Date.now() + timeoutMs;
+    let connectedId: string | undefined;
+    while (Date.now() < deadline && !connectedId) {
+      await new Promise((r) => setTimeout(r, 500));
+      connectedId = this.bridge.getInstances().map((i) => i.instanceId).find((id) => !before.has(id));
+    }
+
+    if (!connectedId) {
+      const reason = 'Studio launched, but the MCP plugin did not connect before the timeout.';
+      if (record.state === 'launching') await this.studioInstances.markFailed(record, reason);
+      if (record.closedAt === undefined) {
+        await this.studioInstances.close(record).catch(() => undefined);
+      }
+      return this.jsonResult({ ...this.managedStatus(record), error: record.failureReason ?? reason });
+    }
+
+    await this.studioInstances.attachInstanceId(record, connectedId);
+    return this.jsonResult({
+      ...this.managedStatus(record),
+      instance_id: connectedId,
+      message: source === 'place_revision' ? `Studio opened place revision ${placeVersion}.` : 'Studio opened.',
+    });
+  }
+
+  // --- Playtest control --------------------------------------------------------
+
+  /**
+   * Start, stop, or inspect a single-player playtest.
+   *
+   * A verb wrapper over start_playtest / stop_playtest / get_playtest_output, which stay
+   * as they are. One tool because "run the game and tell me what it printed" is one
+   * intention, and three tools make the caller sequence it by hand.
+   */
+  async soloPlaytest(action?: string, mode?: string, timeout?: number) {
+    const verb = action || 'start';
+    // startPlaytest refuses anything but play/run, so default here rather than passing
+    // undefined through and getting its error for a parameter the caller never set.
+    if (verb === 'start') return this.startPlaytest(mode || 'play', undefined);
+    if (verb === 'stop') return this.stopPlaytest();
+    if (verb === 'state' || verb === 'output') return this.getPlaytestOutput(undefined);
+    throw new Error(`solo_playtest action must be start, stop or state (got: ${verb})`);
+  }
+
+  /**
+   * Run or inspect a multi-client Studio test.
+   *
+   * Driven from the EDIT peer: ExecuteMultiplayerTestAsync is what creates the server and
+   * client DataModels, so asking a peer that only exists because of it is circular. The
+   * plugin refuses the call anywhere else rather than hanging.
+   */
+  async multiplayerPlaytest(action?: string, numPlayers?: number, target?: string, testArgs?: unknown, value?: unknown, timeout?: number) {
+    const verb = action || 'start';
+    const routes: Record<string, string> = {
+      start: '/api/multiplayer-test-start',
+      state: '/api/multiplayer-test-state',
+      add_players: '/api/multiplayer-test-add-players',
+      leave_client: '/api/multiplayer-test-leave-client',
+      end: '/api/multiplayer-test-end',
+    };
+    const endpoint = routes[verb];
+    if (!endpoint) {
+      throw new Error(`multiplayer_playtest action must be one of ${Object.keys(routes).join(', ')} (got: ${verb})`);
+    }
+    // `state` is the one that reads a live peer; the rest steer the test from edit.
+    const peer = verb === 'state' ? (target || 'edit') : 'edit';
+    return this.peerRequest(endpoint, peer, { numPlayers, testArgs, value, timeout });
+  }
+
+  // --- Device and network simulation -------------------------------------------
+  //
+  // No plugin endpoint of their own. StudioDeviceSimulatorService and NetworkSettings are
+  // reachable from any Luau the plugin runs, so these generate a script and send it down
+  // the execute-luau route that already exists -- see simulation-luau.ts.
+
+  /**
+   * Runs generated Luau on one peer and unwraps the JSON it returned.
+   *
+   * executeLuau answers { success, returnValue } with returnValue ALREADY stringified, so
+   * the generated scripts JSONEncode their result and this decodes it. A script that threw
+   * surfaces its Luau error rather than a parse failure two lines later.
+   */
+  private async runLuauJson(peer: string, code: string, what: string): Promise<any> {
+    type LuauReply = { success?: boolean; returnValue?: string; error?: string; output?: string[] };
+    const reply: LuauReply = await this.peerRaw('/api/execute-luau', peer, { code });
+    if (reply.success === false) {
+      throw new Error(`${what} failed on ${peer}: ${reply.error ?? 'unknown error'}`);
+    }
+    if (!reply.returnValue) {
+      throw new Error(`${what} on ${peer} returned nothing. Output: ${(reply.output ?? []).join(' | ') || '(none)'}`);
+    }
+    try {
+      return JSON.parse(reply.returnValue);
+    } catch {
+      // Not JSON means the script hit a path that returned a bare value; show it rather
+      // than claiming the tool failed.
+      return { raw: reply.returnValue };
+    }
+  }
+
+  async setDeviceSimulator(body: any = {}) {
+    const settings = normalizeDeviceSimulatorSettings(body);
+    const stopping = body.stopSimulation === true;
+    if (stopping && hasDeviceSimulatorSettings(settings)) {
+      throw new Error('stopSimulation=true cannot be combined with deviceId, orientation, resolution, pixelDensity or scalingMode');
+    }
+    if (!stopping && !hasDeviceSimulatorSettings(settings)) {
+      throw new Error('set_device_simulator needs stopSimulation=true or at least one simulator setting');
+    }
+    const peer = body.target || 'edit';
+    const code = buildDeviceSimulatorLuau('set', stopping ? { stopSimulation: true } : { settings });
+    return this.jsonResult(await this.runLuauJson(peer, code, 'device simulator set'));
+  }
+
+  async getDeviceSimulatorState(body: any = {}) {
+    const peer = body.target || 'edit';
+    const code = buildDeviceSimulatorLuau('get', {});
+    return this.jsonResult(await this.runLuauJson(peer, code, 'device simulator get'));
+  }
+
+  /**
+   * One screenshot per device setting, so layouts can be compared side by side.
+   *
+   * Sequential, not parallel: there is one viewport, and setting the next device before
+   * the previous screenshot has been taken photographs the wrong one. The original state
+   * is read first and restored at the end, including the case where a capture throws --
+   * leaving the editor stuck simulating a phone would be a nasty thing to walk away from.
+   */
+  async captureDeviceMatrix(body: any = {}) {
+    const entries = body.entries;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new Error('capture_device_matrix requires a non-empty entries array');
+    }
+    if (entries.length > MAX_DEVICE_MATRIX_ENTRIES) {
+      throw new Error(`capture_device_matrix accepts at most ${MAX_DEVICE_MATRIX_ENTRIES} entries (got ${entries.length})`);
+    }
+    const peer = body.target || 'edit';
+    const before = await this.runLuauJson(peer, buildDeviceSimulatorLuau('get', {}), 'device simulator get');
+
+    const shots: unknown[] = [];
+    try {
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const settings = normalizeDeviceSimulatorSettings(entry);
+        await this.runLuauJson(peer, buildDeviceSimulatorLuau('set', { settings }), 'device simulator set');
+        const shot = await this.peerRaw('/api/capture-screenshot', peer, body.capture ?? {});
+        shots.push({ label: entry.label ?? entry.deviceId ?? `entry-${i + 1}`, settings, capture: shot });
+      }
+    } finally {
+      const restore = before?.isSimulating === true && typeof before?.activeDeviceId === 'string' && before.activeDeviceId !== 'default'
+        ? { settings: normalizeDeviceSimulatorSettings(before) }
+        : { stopSimulation: true };
+      await this.runLuauJson(peer, buildDeviceSimulatorLuau('set', restore), 'device simulator restore').catch(() => undefined);
+    }
+
+    return this.jsonResult({ target: peer, count: shots.length, entries: shots });
+  }
+
+  async setNetworkProfile(body: any = {}) {
+    const values = normalizeNetworkProfile(body.profile, body.overrides);
+    const peer = body.target || 'client-1';
+    const code = buildNetworkProfileLuau(body.profile, values);
+    return this.jsonResult(await this.runLuauJson(peer, code, 'network profile set'));
+  }
+
+  async getSimulationState(body: any = {}) {
+    const peer = body.target || 'edit';
+    const network = await this.runLuauJson(peer, buildNetworkStateLuau('get'), 'network state get');
+    const device = await this.runLuauJson(peer, buildDeviceSimulatorLuau('get', {}), 'device simulator get');
+    return this.jsonResult({ target: peer, network, deviceSimulator: device, notes: SIMULATION_PERSISTENCE_NOTES });
+  }
+
+  async resetSimulationState(body: any = {}) {
+    const peer = body.target || 'edit';
+    const include = body.include ?? 'both';
+    const result: Record<string, unknown> = { target: peer, include };
+    if (include === 'network' || include === 'both') {
+      result.network = await this.runLuauJson(peer, buildNetworkStateLuau('reset'), 'network state reset');
+    }
+    if (include === 'deviceSimulator' || include === 'both') {
+      result.deviceSimulator = await this.runLuauJson(
+        peer, buildDeviceSimulatorLuau('set', { stopSimulation: true }), 'device simulator stop');
+    }
+    result.notes = SIMULATION_PERSISTENCE_NOTES;
+    return this.jsonResult(result);
   }
 
   // --- Profiling and scene cost ------------------------------------------------
