@@ -1,5 +1,6 @@
-import { createWriteStream, existsSync, mkdirSync, unlinkSync } from 'fs';
-import { join } from 'path';
+import { copyFileSync, createWriteStream, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { get } from 'https';
 import { IncomingMessage } from 'http';
@@ -80,12 +81,42 @@ async function findDevRelease(): Promise<{ tag_name: string; assets: { name: str
   return prerelease;
 }
 
+/**
+ * The plugin shipped inside THIS package, if there is one.
+ *
+ * npm publishes studio-plugin/ alongside dist/, so the package already carries the exact
+ * plugin its server expects. Preferring it removes a whole class of version skew: the
+ * GitHub release below is cut by hand and lags, so `npx @6xvl/robloxstudio-mcp@latest
+ * --install-plugin` was installing an older plugin than the server it came with -- which
+ * shows up as tools that exist in the tool list and answer "unknown endpoint".
+ */
+function bundledPlugin(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    join(here, '..', 'studio-plugin', 'MCPPlugin.rbxmx'),
+    join(here, '..', '..', 'studio-plugin', 'MCPPlugin.rbxmx'),
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 export async function installPlugin(): Promise<void> {
   const dev = process.argv.includes('--dev');
   const pluginsFolder = getPluginsFolder();
 
   if (!existsSync(pluginsFolder)) {
     mkdirSync(pluginsFolder, { recursive: true });
+  }
+
+  // --dev still goes to GitHub: that flag exists to pull a prerelease newer than the
+  // published package, so reading the package would defeat it.
+  const bundled = dev ? undefined : bundledPlugin();
+  if (bundled) {
+    const dest = join(pluginsFolder, ASSET_NAME);
+    copyFileSync(bundled, dest);
+    console.log(`Installed the plugin bundled with this package to ${dest}`);
+    return;
   }
 
   console.log(dev ? 'Fetching latest dev prerelease...' : 'Fetching latest release...');
