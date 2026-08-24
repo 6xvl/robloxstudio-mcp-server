@@ -2112,6 +2112,306 @@ part(0,2,0,2,1,1,"b")`,
     inputSchema: { type: 'object', properties: {} }
   },
 
+
+  // === Profiling, memory and breakpoints (schemas ported verbatim from Chrrxs/robloxstudio-mcp, MIT, so they match the handlers) ===
+  {
+    name: 'capture_script_profiler',
+    category: 'read',
+    description: 'Use to find Luau CPU hotspots on a running server or client.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          pattern: '^(server|client-[0-9]+)$',
+          description: 'Running server or client-N; edit is invalid.'
+        },
+        duration_ms: {
+          type: 'number',
+          default: 1000,
+          minimum: 100,
+          maximum: 15000,
+          description: 'Capture length in ms.'
+        },
+        frequency: {
+          type: 'number',
+          default: 1000,
+          minimum: 1,
+          maximum: 10000,
+          description: 'Samples per second.'
+        },
+        max_functions: {
+          type: 'number',
+          default: 20,
+          minimum: 1,
+          maximum: 100,
+          description: 'Returned function and debug-label limit.'
+        },
+        min_total_us: {
+          type: 'number',
+          default: 0,
+          minimum: 0,
+          description: 'Minimum function TotalDuration in microseconds.'
+        },
+        filter: {
+          type: 'string',
+          description: 'Case-insensitive function name or source substring.'
+        },
+        include_native: {
+          type: 'boolean',
+          description: 'Include native frames; defaults to false.'
+        },
+        include_plugin: {
+          type: 'boolean',
+          description: 'Include plugin frames; defaults to false.'
+        },
+        output_path: {
+          type: 'string',
+          description: 'Raw JSON file; the response returns only its path.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'capture_micro_profiler',
+    category: 'read',
+    description: 'Use to profile engine and game frame time on a live peer.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          pattern: '^(server|client-[0-9]+)$',
+          description: 'Running server or client-N; edit is invalid.'
+        },
+        duration_ms: {
+          type: 'number',
+          default: 1000,
+          minimum: 100,
+          maximum: 5000,
+          description: 'Capture length in ms.'
+        },
+        focus: {
+          type: 'string',
+          enum: ['all', 'script', 'physics', 'render', 'network', 'jobs'],
+          default: 'all',
+          description: 'Subsystem filter.'
+        },
+        filter: {
+          type: 'string',
+          description: 'Case-insensitive timer or group substring.'
+        },
+        max_timers: {
+          type: 'number',
+          default: 20,
+          minimum: 1,
+          maximum: 100,
+          description: 'Returned timer limit.'
+        },
+        max_groups: {
+          type: 'number',
+          default: 20,
+          minimum: 1,
+          maximum: 100,
+          description: 'Returned group limit; each group includes hot timers.'
+        },
+        max_timers_per_group: {
+          type: 'number',
+          default: 5,
+          minimum: 0,
+          maximum: 20,
+          description: 'Nested timers per group; 0 omits them.'
+        },
+        max_related_timers: {
+          type: 'number',
+          default: 3,
+          minimum: 0,
+          maximum: 10,
+          description: 'Parent, child, and thread rows per timer; 0 omits them.'
+        },
+        min_total_us: {
+          type: 'number',
+          default: 0,
+          minimum: 0,
+          description: 'Minimum inclusive_us after other filters.'
+        },
+        include_idle: {
+          type: 'boolean',
+          description: 'Include idle timers; defaults to false.'
+        },
+        include_gpu: {
+          type: 'boolean',
+          description: 'Include GPU events; defaults to false.'
+        },
+        max_events: {
+          type: 'number',
+          default: 250000,
+          minimum: 10000,
+          maximum: 1000000,
+          description: 'LibMP event inspection limit.'
+        },
+        frame_window: {
+          type: 'number',
+          default: 240,
+          minimum: 1,
+          maximum: 2000,
+          description: 'Trailing frames to analyze.'
+        },
+        output_path: {
+          type: 'string',
+          description: 'Raw snapshot file; the response stays summarized.'
+        },
+        summary_output_path: {
+          type: 'string',
+          description: 'Summary JSON file with its comparison index.'
+        },
+        baseline_path: {
+          type: 'string',
+          description: 'Summary file used as the baseline.'
+        },
+        baseline: {
+          type: 'object',
+          description: 'Inline summary used as the baseline.'
+        },
+        baseline_label: {
+          type: 'string',
+          description: 'Baseline comparison label.'
+        },
+        current_label: {
+          type: 'string',
+          description: 'Current comparison label.'
+        },
+        max_comparison_rows: {
+          type: 'number',
+          default: 20,
+          minimum: 1,
+          maximum: 100,
+          description: 'Rows returned per comparison section.'
+        },
+        include_comparison_index: {
+          type: 'boolean',
+          description: 'Return the full comparison index; defaults to false.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_memory_breakdown',
+    category: 'read',
+    description: 'Use to compare memory categories across Studio peers.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: {
+          type: 'string',
+          description: 'Edit, server, client-N, or all; defaults to all.'
+        },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'DeveloperMemoryTag filter; unknown tags return zero.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_scene_analysis',
+    category: 'read',
+    description: 'Use to attribute scene cost across instances and content.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['all', 'instance_composition', 'script_memory', 'unparented_instances', 'triangle_composition', 'animation_memory', 'audio_memory'],
+          description: 'Analysis mode; defaults to all.'
+        },
+        target: {
+          type: 'string',
+          description: 'Edit, server, client-N, or all; defaults to all.'
+        },
+        topN: {
+          type: 'number',
+          minimum: 1,
+          maximum: 100,
+          description: 'Flattened entries per mode; defaults to 10.'
+        },
+        raw: {
+          type: 'boolean',
+          description: 'Include full nested result trees; defaults to false.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      }
+    }
+  },
+  {
+    name: 'breakpoints',
+    category: 'write',
+    description: 'Use to trace script execution with breakpoints or logpoints.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['set', 'remove', 'clear', 'list'],
+          description: 'Operation; set/remove need location; clear targets MCP entries.'
+        },
+        clear_all: {
+          type: 'boolean',
+          description: 'With clear, also remove user-created breakpoints.'
+        },
+        script_path: {
+          type: 'string',
+          description: 'Script path; required for set and remove.'
+        },
+        line: {
+          type: 'number',
+          description: '1-based line for set or remove.'
+        },
+        enabled: {
+          type: 'boolean',
+          description: 'Initial enabled state; defaults to true.'
+        },
+        condition: {
+          type: 'string',
+          description: 'Luau condition for set.'
+        },
+        log_message: {
+          type: 'string',
+          description: 'Luau expressions to log; quote literal text.'
+        },
+        continue_execution: {
+          type: 'boolean',
+          description: 'Continue after hit; defaults true; false needs a resumer.'
+        },
+        target: {
+          type: 'string',
+          description: 'Edit, server, or client-N; defaults to edit.'
+        },
+        instance_id: {
+          type: 'string',
+          description: 'Connected place ID; required with multiple places.'
+        }
+      },
+      required: ['action']
+    }
+  },
+
   // === Selection and .rbxm round-trip ===
   {
     name: 'selection',

@@ -3,11 +3,15 @@ import State from "../modules/State";
 import UI from "../modules/UI";
 import Communication from "../modules/Communication";
 import RuntimeLogBuffer from "../modules/RuntimeLogBuffer";
+import BreakpointHandlers from "../modules/handlers/BreakpointHandlers";
 import { cleanupLegacyEditBridges, ensureRuntimeBridgeInstalled } from "../modules/EvalBridges";
 
 // Attach the per-peer LogService listener before anything else, so boot-time prints from
 // the place's own scripts are captured rather than missed. Idempotent.
 RuntimeLogBuffer.install();
+
+// Breakpoints are stored through plugin:SetSetting, so the module needs the handle.
+BreakpointHandlers.init(plugin);
 
 UI.init(plugin);
 const elements = UI.getElements();

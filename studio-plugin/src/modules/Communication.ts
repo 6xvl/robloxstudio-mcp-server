@@ -17,6 +17,11 @@ import LogHandlers from "./handlers/LogHandlers";
 import SelectionHandlers from "./handlers/SelectionHandlers";
 import SerializationHandlers from "./handlers/SerializationHandlers";
 import GenerateModelHandlers from "./handlers/GenerateModelHandlers";
+import ScriptProfilerHandlers from "./handlers/ScriptProfilerHandlers";
+import MicroProfilerHandlers from "./handlers/MicroProfilerHandlers";
+import MemoryHandlers from "./handlers/MemoryHandlers";
+import SceneAnalysisHandlers from "./handlers/SceneAnalysisHandlers";
+import BreakpointHandlers from "./handlers/BreakpointHandlers";
 import { Connection, RequestPayload, PollResponse, ReadyResponse } from "../types";
 
 const instanceId = HttpService.GenerateGUID(false);
@@ -84,6 +89,11 @@ const routeMap: Record<string, Handler> = {
 	"/api/export-rbxm": SerializationHandlers.exportRbxm,
 	"/api/import-rbxm": SerializationHandlers.importRbxm,
 	"/api/generate-model": GenerateModelHandlers.generateModel,
+	"/api/capture-script-profiler": ScriptProfilerHandlers.captureScriptProfiler,
+	"/api/capture-micro-profiler": MicroProfilerHandlers.captureMicroProfiler,
+	"/api/get-memory-breakdown": MemoryHandlers.getMemoryBreakdown,
+	"/api/get-scene-analysis": SceneAnalysisHandlers.getSceneAnalysis,
+	"/api/breakpoints": BreakpointHandlers.breakpoints,
 	"/api/undo": MetadataHandlers.undo,
 	"/api/redo": MetadataHandlers.redo,
 	"/api/bulk-set-attributes": MetadataHandlers.bulkSetAttributes,

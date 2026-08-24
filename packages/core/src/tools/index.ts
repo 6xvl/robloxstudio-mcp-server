@@ -2011,6 +2011,66 @@ export class RobloxStudioTools {
     return { content: [{ type: 'text', text: JSON.stringify({ peers: results }) }] };
   }
 
+  // --- Profiling and scene cost ------------------------------------------------
+  //
+  // All of these read a LIVE peer. profile_snapshot samples Stats and answers "the frame
+  // is slow"; these answer "which function" and "which instances", which is the question
+  // you actually have. edit is not a valid target for the two profilers: there is no game
+  // running in it to profile.
+
+  /** Luau CPU hotspots on a running server or client, ranked by total time. */
+  captureScriptProfiler(body: any = {}) {
+    const peer = body.target || 'server';
+    if (peer === 'edit') throw new Error('capture_script_profiler needs a running peer: server or client-N, not edit.');
+    return this.peerRequest('/api/capture-script-profiler', peer, body);
+  }
+
+  /** Engine and game frame time on a live peer, by timer and group. */
+  captureMicroProfiler(body: any = {}) {
+    const peer = body.target || 'server';
+    if (peer === 'edit') throw new Error('capture_micro_profiler needs a running peer: server or client-N, not edit.');
+    return this.peerRequest('/api/capture-micro-profiler', peer, body);
+  }
+
+  /** Memory by DeveloperMemoryTag, compared across peers. */
+  getMemoryBreakdown(body: any = {}) {
+    return this.fanOut('/api/get-memory-breakdown', body.target, body);
+  }
+
+  /** Scene cost attributed across instances and content. */
+  getSceneAnalysis(body: any = {}) {
+    return this.fanOut('/api/get-scene-analysis', body.target, body);
+  }
+
+  /** Breakpoints and logpoints. Registry lives in plugin settings, so it survives a reload. */
+  breakpoints(body: any = {}) {
+    return this.passthrough('/api/breakpoints', body);
+  }
+
+  /**
+   * Ask every connected peer, or one named peer.
+   *
+   * The comparison IS the answer for memory and scene cost -- server and client hold
+   * different things, and a single number cannot show you which side is carrying the
+   * weight. A peer that fails is reported in place rather than losing the ones that
+   * answered, because a playtest half up is the normal case for these.
+   */
+  private async fanOut(endpoint: string, target: string | undefined, body: any) {
+    if (target && target !== 'all') {
+      return this.peerRequest(endpoint, target, body);
+    }
+    const peers = ['edit', ...this.bridge.getInstances().map(i => i.role).filter(r => r !== 'edit')];
+    const results: Record<string, unknown> = {};
+    for (const peer of [...new Set(peers)]) {
+      try {
+        results[peer] = await this.client.request(endpoint, body, peer);
+      } catch (error) {
+        results[peer] = { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    return this.jsonResult({ peers: results });
+  }
+
   // --- Reference documentation -------------------------------------------------
   // Neither of these touches the plugin: one reads create.roblox.com, the other reads
   // files on this machine. They answer with no Studio connected at all, which is the
