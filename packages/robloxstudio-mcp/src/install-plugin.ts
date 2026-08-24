@@ -101,6 +101,27 @@ function bundledPlugin(): string | undefined {
   return undefined;
 }
 
+/**
+ * Two files, one plugin, twice the trouble.
+ *
+ * Building from source writes MCPPlugin.rbxmx; this installer writes
+ * MCPPlugin-release.rbxmx. Do both and Studio loads BOTH, so two plugin instances register
+ * two instanceIds and both poll the bridge -- which is the same shape as the duplicate-
+ * delivery bug that used to append a copy of every script edit.
+ *
+ * Only the other NAME is removed, and only after the install above succeeded.
+ */
+function removeRivalPlugin(pluginsFolder: string): void {
+  const rival = join(pluginsFolder, 'MCPPlugin.rbxmx');
+  if (rival === join(pluginsFolder, ASSET_NAME) || !existsSync(rival)) return;
+  try {
+    unlinkSync(rival);
+    console.log(`Removed ${rival} so Studio does not load two copies of the plugin.`);
+  } catch {
+    console.log(`Could not remove ${rival}. Delete it by hand, or Studio loads two copies.`);
+  }
+}
+
 export async function installPlugin(): Promise<void> {
   const dev = process.argv.includes('--dev');
   const pluginsFolder = getPluginsFolder();
@@ -115,6 +136,7 @@ export async function installPlugin(): Promise<void> {
   if (bundled) {
     const dest = join(pluginsFolder, ASSET_NAME);
     copyFileSync(bundled, dest);
+    removeRivalPlugin(pluginsFolder);
     console.log(`Installed the plugin bundled with this package to ${dest}`);
     return;
   }
