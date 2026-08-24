@@ -738,9 +738,9 @@ local function computeBridgeStamp()
 	for i = 1, #combined do
 		h = (h * 33 + (string.byte(combined, i))) % 2147483647
 	end
-	-- "3.2.0" is replaced with the package version at package time
+	-- "3.2.1" is replaced with the package version at package time
 	-- (scripts/build-plugin.mjs injectVersion), so a release bump also restamps.
-	return `{tostring(h)}-3.2.0`
+	return `{tostring(h)}-3.2.1`
 end
 local BRIDGE_STAMP = computeBridgeStamp()
 local function setSource(scriptInst, source)
@@ -10233,7 +10233,7 @@ return {
         <Properties>
           <string name="Name">State</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
-local CURRENT_VERSION = "3.2.0"
+local CURRENT_VERSION = "3.2.1"
 local MAX_CONNECTIONS = 5
 local BASE_PORT = 58741
 local activeTabIndex = 0
