@@ -210,6 +210,6 @@ Then connect tab 1 in the first Studio and tab 2 in the second. Within one serve
 
 ---
 
-<!-- VERSION_LINE -->**v3.1.0** — 96+ tools, multi-Studio routing, Roblox MCP hook, Blender-parity hang controls
+<!-- VERSION_LINE -->**v3.2.0** — 96+ tools, multi-Studio routing, Roblox MCP hook, Blender-parity hang controls
 
 [Report Issues](https://github.com/6xvl/robloxstudio-mcp-server/issues) | MIT Licensed
