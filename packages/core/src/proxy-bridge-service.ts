@@ -1,4 +1,4 @@
-import { BridgeService } from './bridge-service.js';
+import { BridgeService, type PluginInstance } from './bridge-service.js';
 import { v4 as uuidv4 } from 'uuid';
 
 export class ProxyBridgeService extends BridgeService {
@@ -10,9 +10,55 @@ export class ProxyBridgeService extends BridgeService {
     super();
     this.primaryBaseUrl = primaryBaseUrl;
     this.proxyInstanceId = uuidv4();
+
+    void this.refreshInstances();
+    // unref so a proxy that is otherwise idle does not hold the process open.
+    const timer = setInterval(() => void this.refreshInstances(), 2000);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
   }
 
-  override async sendRequest(endpoint: string, data: any, target = 'edit'): Promise<any> {
+  /**
+   * A proxy owns no state: the primary holds the instances and the pending queue. Without
+   * forwarding this, the second MCP client on the machine saw an empty world --
+   * list_studios returned nothing and set_active_studio could not find a Studio that was
+   * plainly connected.
+   *
+   * Cached rather than fetched on call, because the base method is synchronous and every
+   * caller relies on that. A couple of seconds stale is fine for a list of open Studios;
+   * they do not come and go inside one tool call.
+   */
+  private cachedInstances: PluginInstance[] = [];
+
+  override getInstances(): PluginInstance[] {
+    return this.cachedInstances;
+  }
+
+  private async refreshInstances() {
+    try {
+      const response = await fetch(`${this.primaryBaseUrl}/instances`);
+      if (!response.ok) return;
+      const body = await response.json() as { instances?: PluginInstance[] };
+      this.cachedInstances = body.instances ?? [];
+    } catch {
+      // Primary is down or restarting. Keeping the last list beats blanking it: the
+      // next poll repairs it, and a momentary empty list looks like every Studio closed.
+    }
+  }
+
+  // Kept LOCAL on purpose. The preference is this client's aim, and pushing it to the
+  // primary would repoint every other client sharing the bridge. It reaches the primary
+  // as a per-request pin instead -- see targetInstanceId in sendRequest.
+  override setPreferredInstance(instanceId: string | null) {
+    this.preferred = instanceId;
+  }
+
+  override getPreferredInstance(): string | null {
+    return this.preferred;
+  }
+
+  private preferred: string | null = null;
+
+  override async sendRequest(endpoint: string, data: any, target = 'edit', targetInstanceId?: string): Promise<any> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.proxyRequestTimeout);
 
@@ -20,7 +66,15 @@ export class ProxyBridgeService extends BridgeService {
       const response = await fetch(`${this.primaryBaseUrl}/proxy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint, data, target, proxyInstanceId: this.proxyInstanceId }),
+        body: JSON.stringify({
+          endpoint,
+          data,
+          target,
+          // This client's chosen Studio, pinned to the request so the primary hands it
+          // to that instance and nobody else's tool call is redirected.
+          targetInstanceId: targetInstanceId ?? this.preferred ?? undefined,
+          proxyInstanceId: this.proxyInstanceId,
+        }),
         signal: controller.signal,
       });
 

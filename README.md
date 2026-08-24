@@ -140,13 +140,46 @@ Set `ROBLOX_MCP_HOOK=1` to *force* the hook on, or `0` to force it off (default:
 <details>
 <summary>Server says "Waiting for Studio plugin to connect..." forever</summary>
 
-The Studio plugin connects to **one** HTTP port (default `58741`). If that port is already taken by another MCP instance, this server auto-shifts to the next free port (`58742`, `58743`, ...) — and the plugin never finds it. Pin the port explicitly so it matches the plugin:
+The Studio plugin connects to **one** HTTP port (default `58741`).
+
+If another **robloxstudio-mcp** already owns that port, this server no longer competes with it — it enters **proxy mode** and shares that server's Studio connection (see *Several AI clients at once* below). Nothing to configure.
+
+If something **else** is squatting on the port, the server climbs to the next free one (`58742`, `58743`, ...) and warns — and the plugin will not find it there. Pin the port so it matches the plugin:
 
 ```bash
 claude mcp add robloxstudio -- npx -y @6xvl/robloxstudio-mcp@latest --port 58741
 ```
 
-Running several Studios at once? Give each its own port (`--port 58741`, `--port 58742`) and one MCP entry per port. Remove any duplicate entries pointing at the same port first (`claude mcp remove <name>`).
+`--port` and `ROBLOX_STUDIO_PORT` do the same thing; the flag wins.
+</details>
+
+<details>
+<summary>Several AI clients at once (two Claude terminals, Claude + Codex, ...)</summary>
+
+**Just run them.** The first instance to start binds the port and becomes the **primary**; every later one detects it and becomes a **proxy**, forwarding its tool calls through the primary to the same Studio. You do not have to shut one down to use another, and they do not need separate ports.
+
+Each client keeps its own `set_active_studio` choice — a per-request pin travels with every call, so one client picking a place cannot retarget another's tool calls.
+
+Check it end to end with the primary running:
+
+```bash
+node scripts/check-proxy-mode.mjs
+```
+
+If the primary exits, a proxy promotes itself to primary within a few seconds and the plugin reconnects to it.
+</details>
+
+<details>
+<summary>Several <em>Studio places</em> open at once</summary>
+
+Different from the above: that is many AI clients, this is many **Studios**. The plugin window has one tab per port, so give each Studio its own port and add one MCP entry per port:
+
+```bash
+claude mcp add robloxstudio  -- npx -y @6xvl/robloxstudio-mcp@latest --port 58741
+claude mcp add robloxstudio2 -- npx -y @6xvl/robloxstudio-mcp@latest --port 58742
+```
+
+Then connect tab 1 in the first Studio and tab 2 in the second. Within one server, `list_studios` and `set_active_studio` pick between places connected to the same port.
 </details>
 
 <details>

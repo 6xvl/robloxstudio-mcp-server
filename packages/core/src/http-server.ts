@@ -301,7 +301,7 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       return;
     }
 
-    const pendingRequest = bridge.getPendingRequest(callerRole);
+    const pendingRequest = bridge.getPendingRequest(callerRole, instanceId);
     if (pendingRequest) {
       res.json({
         request: pendingRequest.request,
@@ -339,7 +339,7 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
 
 
   app.post('/proxy', async (req, res) => {
-    const { endpoint, data, target, proxyInstanceId } = req.body;
+    const { endpoint, data, target, targetInstanceId, proxyInstanceId } = req.body;
 
     if (!endpoint) {
       res.status(400).json({ error: 'endpoint is required' });
@@ -351,7 +351,11 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
     }
 
     try {
-      const response = await bridge.sendRequest(endpoint, data, target || 'edit');
+      // The pin comes from the proxying client, which is the only party that knows
+      // which Studio IT is aiming at. Without carrying it through, every proxied call
+      // fell back to this server's global preference -- one client's choice steering
+      // everybody's tool calls.
+      const response = await bridge.sendRequest(endpoint, data, target || 'edit', targetInstanceId);
       res.json({ response });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Proxy request failed' });
@@ -436,6 +440,10 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
               }) }] };
             }
             serverConfig.activeStudioMap?.set(sessionId, match.role);
+            // Bind the INSTANCE, not just the role. Tools call through with the default
+            // target 'edit', so storing a role alone changed nothing when two places
+            // shared it -- the selection was decorative and routing stayed a coin flip.
+            bridge.setPreferredInstance(match.instanceId);
             return { content: [{ type: 'text', text: JSON.stringify({ success: true, active: match.role, instanceId: match.instanceId }) }] };
           }
 
@@ -542,7 +550,12 @@ export function listenWithRetry(
         return;
       } catch (err: any) {
         if (err.code === 'EADDRINUSE') {
-          console.error(`Port ${port} in use, trying next...`);
+          // Only when there IS a next one. server.ts asks for a single attempt at the
+          // base port precisely so it can decide to proxy instead, and announcing a
+          // climb that never happens sends anyone reading the log the wrong way.
+          if (i < maxAttempts - 1) {
+            console.error(`Port ${port} in use, trying next...`);
+          }
           continue;
         }
         reject(err);

@@ -130,6 +130,8 @@ export class RobloxStudioMCPServer {
           }) }] };
         }
         this.activeStudioByClient.set('_default', match.role);
+        // Bind the INSTANCE, not just the role -- see the twin in http-server.ts.
+        this.bridge.setPreferredInstance(match.instanceId);
         return { content: [{ type: 'text', text: JSON.stringify({ success: true, active: match.role, instanceId: match.instanceId }) }] };
       }
 
@@ -170,23 +172,76 @@ export class RobloxStudioMCPServer {
       activeStudioMap: this.activeStudioByClient,
     });
 
+    /**
+     * Is the thing already holding `port` one of US, or something unrelated?
+     *
+     * This decides climb-vs-proxy below, and getting it wrong is the whole bug this
+     * answers. The Studio plugin connects to ONE port. Climbing to the next free one
+     * when a sibling MCP server owns the base port produces a second "primary" that no
+     * plugin is attached to -- so every tool call on that client hangs, which is why
+     * running a second Claude used to mean shutting the first one down.
+     *
+     * /health is the fingerprint: only our own server answers it with this service name.
+     * A short timeout because this is startup latency on every launch after the first,
+     * and a port held by something that does not answer HTTP must not stall the boot.
+     */
+    const siblingOwns = async (port: number): Promise<boolean> => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 1500);
+      try {
+        const res = await fetch(`http://localhost:${port}/health`, { signal: controller.signal });
+        if (!res.ok) return false;
+        const body = await res.json() as { service?: string };
+        return body.service === 'robloxstudio-mcp';
+      } catch {
+        // Unreachable, not HTTP, or too slow: treat as a stranger and climb past it.
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    /**
+     * Bind the base port, or say why not.
+     *
+     * ONE attempt at the base port, then a decision -- never a blind climb. `climbed`
+     * tells the caller a stranger was on the base port and we moved, which is the one
+     * case where a port other than the base is still the right answer.
+     */
+    const bindPrimary = async (): Promise<{ server: http.Server; port: number } | 'sibling'> => {
+      try {
+        return await listenWithRetry(primaryApp!, host, basePort, 1);
+      } catch (err) {
+        if (await siblingOwns(basePort)) return 'sibling';
+        // Something else has it -- a stale process, another tool, a leftover listener.
+        // Climbing is right here: there is no sibling to proxy to, and the plugin can be
+        // pointed at the new port. Warned, because it is not what the plugin expects.
+        console.error(`Port ${basePort} is held by something that is not a robloxstudio-mcp server; climbing`);
+        return await listenWithRetry(primaryApp!, host, basePort + 1, 4);
+      }
+    };
+
     // Try to bind as primary
     try {
       primaryApp = createHttpServer(this.tools, this.bridge, this.allowedToolNames, buildHttpConfig());
-      const result = await listenWithRetry(primaryApp, host, basePort, 5);
+      const result = await bindPrimary();
+      if (result === 'sibling') {
+        throw new Error(`another robloxstudio-mcp server already owns port ${basePort}`);
+      }
       httpHandle = result.server;
       boundPort = result.port;
       console.error(`HTTP server listening on ${host}:${boundPort} for Studio plugin (primary mode)`);
       console.error(`Streamable HTTP MCP endpoint: http://localhost:${boundPort}/mcp`);
     } catch (err) {
-      // All ports in use — fall back to proxy mode
+      // A sibling owns the port (the normal multi-client case), or every port is taken.
+      // Either way this instance rides the primary's connection instead of competing for it.
       console.error(`Could not bind primary HTTP server: ${(err as Error).message}`);
       bridgeMode = 'proxy';
       primaryApp = undefined;
       const proxyBridge = new ProxyBridgeService(`http://localhost:${basePort}`);
       this.bridge = proxyBridge;
       this.tools = new RobloxStudioTools(this.bridge);
-      console.error(`All ports ${basePort}-${basePort + 4} in use — entering proxy mode (forwarding to localhost:${basePort})`);
+      console.error(`Entering proxy mode — forwarding to the primary on localhost:${basePort}. Several MCP clients can share one Studio this way; this one owns no port of its own.`);
 
       // Periodically try to promote to primary if the port frees up
       // TODO: also poll primary /health.livenessNonce — if it hasn't advanced
@@ -197,7 +252,10 @@ export class RobloxStudioMCPServer {
           this.bridge = new BridgeService();
           this.tools = new RobloxStudioTools(this.bridge);
           primaryApp = createHttpServer(this.tools, this.bridge, this.allowedToolNames, buildHttpConfig());
-          const result = await listenWithRetry(primaryApp, host, basePort, 5);
+          // THE BASE PORT ONLY. Promotion exists to take over the port the plugin is
+          // actually attached to; landing on any other one would make this a primary
+          // with no Studio, which is the failure the initial bind above avoids.
+          const result = await listenWithRetry(primaryApp, host, basePort, 1);
           httpHandle = result.server;
           boundPort = result.port;
           bridgeMode = 'primary';
@@ -274,7 +332,12 @@ export class RobloxStudioMCPServer {
       ? 'MCP server marked as active (primary mode)'
       : 'MCP server active in proxy mode — forwarding requests to primary');
 
-    console.error('Waiting for Studio plugin to connect...');
+    // A proxy owns no port, so no plugin will ever connect TO it -- it reaches Studio
+    // through the primary. Printing the same line either way is how "waiting for the
+    // plugin forever" ends up being the reported symptom of a perfectly healthy proxy.
+    console.error(bridgeMode === 'primary'
+      ? 'Waiting for Studio plugin to connect...'
+      : 'Using the primary\'s Studio connection — no plugin connects to a proxy.');
 
     let routeDriftChecked = false;
     const performRouteDriftCheck = async () => {

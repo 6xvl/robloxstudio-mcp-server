@@ -1,5 +1,6 @@
 import request from 'supertest';
-import { createHttpServer } from '../http-server.js';
+import http from 'http';
+import { createHttpServer, listenWithRetry } from '../http-server.js';
 import { RobloxStudioTools } from '../tools/index.js';
 import { BridgeService } from '../bridge-service.js';
 import { Application } from 'express';
@@ -216,6 +217,41 @@ describe('HTTP Server', () => {
       });
       expect(response.body.lastMCPActivity).toBeGreaterThan(0);
       expect(response.body.uptime).toBeGreaterThan(0);
+    });
+  });
+
+  describe('listenWithRetry port climbing', () => {
+    // The whole multi-client story rests on this. server.ts asks for ONE attempt at the
+    // base port so that a taken port becomes a decision (proxy to the sibling that owns
+    // it) rather than a silent climb. A climb produces a second "primary" on a port the
+    // Studio plugin is not attached to, so every tool call on that client hangs -- which
+    // is why running a second Claude used to mean shutting the first one down.
+    const held: http.Server[] = [];
+
+    afterEach(async () => {
+      await Promise.all(held.splice(0).map(s => new Promise<void>(r => s.close(() => r()))));
+    });
+
+    const occupy = (port: number) => new Promise<void>((resolve, reject) => {
+      const s = http.createServer();
+      s.once('error', reject);
+      s.listen(port, '127.0.0.1', () => { held.push(s); resolve(); });
+    });
+
+    test('maxAttempts 1 refuses a taken port instead of moving to the next', async () => {
+      const port = 59731;
+      await occupy(port);
+
+      await expect(listenWithRetry(app, '127.0.0.1', port, 1)).rejects.toThrow();
+    });
+
+    test('maxAttempts above 1 still climbs, for a port held by something unrelated', async () => {
+      const port = 59741;
+      await occupy(port);
+
+      const result = await listenWithRetry(app, '127.0.0.1', port, 4);
+      held.push(result.server);
+      expect(result.port).toBe(port + 1);
     });
   });
 });
