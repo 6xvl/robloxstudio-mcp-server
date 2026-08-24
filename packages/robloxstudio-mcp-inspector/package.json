@@ -1,6 +1,6 @@
 {
   "name": "@6xvl/robloxstudio-mcp-inspector",
-  "version": "3.0.4",
+  "version": "3.1.0",
   "description": "Read-only Roblox Studio MCP server (inspector edition). Extended fork.",
   "main": "dist/index.js",
   "type": "module",

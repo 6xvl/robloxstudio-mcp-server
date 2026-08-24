@@ -1,7 +1,7 @@
 {
   "name": "@6xvl/robloxstudio-mcp",
-  "version": "3.0.4",
-  "description": "Roblox Studio MCP server \u2014 extended fork with terrain/lighting/animation/sound/particle/tween/textchat/material/profile handlers, Roblox StudioMCP.exe hook, Blender-parity hang controls, multi-Studio routing.",
+  "version": "3.1.0",
+  "description": "Roblox Studio MCP server — extended fork with terrain/lighting/animation/sound/particle/tween/textchat/material/profile handlers, Roblox StudioMCP.exe hook, Blender-parity hang controls, multi-Studio routing.",
   "main": "dist/index.js",
   "type": "module",
   "bin": {
