@@ -4,6 +4,8 @@ import { runBuildExecutor, computeBoundsFromParts } from './build-executor.js';
 import { OpenCloudClient } from '../opencloud-client.js';
 import { RobloxCookieClient } from '../roblox-cookie-client.js';
 import { rgbaToPng } from '../png-encoder.js';
+import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
+import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -1765,4 +1767,80 @@ export class RobloxStudioTools {
   wallyList() { return this.passthrough('/api/wally-list'); }
   packagePublish() { return this.passthrough('/api/package-publish'); }
   physicsBake() { return this.passthrough('/api/physics-bake'); }
+
+  // --- Reference documentation -------------------------------------------------
+  // Neither of these touches the plugin: one reads create.roblox.com, the other reads
+  // files on this machine. They answer with no Studio connected at all, which is the
+  // point -- looking up what a property does should not need a place open.
+
+  /**
+   * Official engine or Luau reference, as the markdown Roblox publishes beside every
+   * page. Ported from Chrrxs/robloxstudio-mcp (MIT).
+   */
+  async getRobloxDocs(name: string, docType?: string, section?: string) {
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      throw new Error('get_roblox_docs requires a name (e.g. "ProximityPrompt")');
+    }
+    const category = docType ?? 'classes';
+    if (!isDocCategory(category)) {
+      throw new Error(`Invalid doc_type "${category}". Valid categories: ${DOC_CATEGORIES.join(', ')}`);
+    }
+    const result = await getRobloxDoc(category, name.trim(), section);
+    return { content: [{ type: 'text', text: result.content }] };
+  }
+
+  /**
+   * The skill documents shipped inside the installed Studio's Assistant bundle. Read off
+   * disk from the newest installed version, so the answer is what THIS Studio knows
+   * rather than what a build from six months ago knew.
+   */
+  async getRobloxSkills(action: string, name?: string) {
+    if (action !== 'list' && action !== 'get') {
+      throw new Error('get_roblox_skills action must be "list" or "get"');
+    }
+
+    const bundle = loadBuiltInStudioSkills();
+    const bundleMetadata = {
+      source: 'installed-studio-assistant',
+      studioVersion: bundle.studioVersion,
+      bundlePath: bundle.bundlePath,
+      bundleModifiedAt: bundle.bundleModifiedAt,
+      bundleSha256: bundle.bundleSha256,
+    };
+
+    if (action === 'list') {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            action,
+            ...bundleMetadata,
+            count: bundle.skills.length,
+            skills: bundle.skills.map((skill) => ({
+              name: skill.name,
+              description: skill.description,
+              document: skill.document,
+              hasCombinedDocument: skill.hasCombinedDocument,
+              contentLength: skill.contentLength,
+              contentSha256: skill.contentSha256,
+            })),
+          }),
+        }],
+      };
+    }
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      throw new Error('get_roblox_skills action="get" requires a skill name from action="list"');
+    }
+    const skill = findBuiltInStudioSkill(bundle, name);
+    if (!skill) {
+      throw new Error(
+        `Built-in Studio skill "${name}" was not found. Available skills: `
+        + bundle.skills.map((candidate) => candidate.name).join(', '),
+      );
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ action, ...bundleMetadata, skill }) }],
+    };
+  }
 }

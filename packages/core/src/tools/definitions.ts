@@ -2111,6 +2111,39 @@ part(0,2,0,2,1,1,"b")`,
     description: 'Bake physics joints. NOT SUPPORTED from plugin — no Studio API exposed.',
     inputSchema: { type: 'object', properties: {} }
   },
+
+  // === Reference documentation (no Studio connection needed) ===
+  {
+    name: 'get_roblox_docs',
+    category: 'read',
+    description: 'Read the official Roblox engine or Luau reference for one name. Answers with no Studio open.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Exact reference name, case-sensitive (e.g. "ProximityPrompt", "TweenInfo").' },
+        doc_type: {
+          type: 'string',
+          enum: ['classes', 'enums', 'datatypes', 'libraries', 'globals'],
+          description: 'Reference category; defaults to classes.'
+        },
+        section: { type: 'string', description: 'Return only this level-two heading (e.g. "Properties"). Large pages list their sections.' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'get_roblox_skills',
+    category: 'read',
+    description: 'List or read the skill documents shipped in the installed Studio Assistant bundle.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'get'], description: 'List every skill, or get one document.' },
+        name: { type: 'string', description: 'Skill name from action="list"; required for get.' }
+      },
+      required: ['action']
+    }
+  },
 ];
 
 export const getReadOnlyTools = () => TOOL_DEFINITIONS.filter(t => t.category === 'read');

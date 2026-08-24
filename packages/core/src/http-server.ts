@@ -164,6 +164,8 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   wally_list: (tools) => tools.wallyList(),
   package_publish: (tools) => tools.packagePublish(),
   physics_bake: (tools) => tools.physicsBake(),
+  get_roblox_docs: (tools, body) => tools.getRobloxDocs(body.name, body.doc_type, body.section),
+  get_roblox_skills: (tools, body) => tools.getRobloxSkills(body.action, body.name),
 };
 
 export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService, allowedTools?: Set<string>, serverConfig?: StreamableHttpConfig) {
