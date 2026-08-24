@@ -10,7 +10,25 @@
 
 An MCP server that lets AI explore your game structure, read/edit scripts, mutate terrain/lighting/animation/sound/particles, profile performance, and route requests across multiple Studio tabs — all locally and safely.
 
-Extended fork with 96+ tools, multi-Studio routing, Blender-parity hang controls, and a Roblox official `StudioMCP.exe` hook.
+Extended fork with 130+ tools, multi-Studio routing, Blender-parity hang controls, and a Roblox official `StudioMCP.exe` hook.
+
+### Live-game tooling
+
+A playtest forks the DataModel, and the plugin runs in each fork — so a running place is several **peers** at once: `edit`, `server`, and `client-1..N`. Tools that need the running game name which peer they mean.
+
+- **`eval_server_runtime` / `eval_client_runtime`** — Luau in the live VM, **sharing its require cache**. `execute_luau` runs in the plugin VM against a fresh ModuleScript, so `require(SomeModule)` hands back a new copy and every table the game has mutated is invisible. These see the real thing.
+- **`get_runtime_logs`** — output per peer, with a `since` cursor. A value that differs between server and client is the shape of every replication bug, and a merged log cannot show which side printed it.
+- **`capture_script_profiler` / `capture_micro_profiler`** — Luau CPU hotspots and engine frame time on a live peer. `profile_snapshot` says a frame is slow; these say which function.
+- **`get_memory_breakdown` / `get_scene_analysis`** — memory by tag and scene cost, compared across peers. Scene modes include `unparented_instances` (a leak detector) and `triangle_composition`.
+- **`breakpoints`** — breakpoints and logpoints, with conditions.
+- **`set_device_simulator` / `capture_device_matrix`** — emulate a device, or screenshot up to six of them in one call.
+- **`set_network_profile`** — simulated latency, jitter and packet loss via `NetworkSettings`.
+- **`solo_playtest` / `multiplayer_playtest`** — run and inspect a test, up to 8 clients.
+- **`import_rbxm` / `export_rbxm`** — real `.rbxm` via SerializationService. Lossless, unlike `export_build`'s compact JSON.
+- **`manage_instance`** — launch, close, and inspect Studio *processes*; list a place's published revisions.
+- **`get_roblox_docs` / `get_roblox_skills`** — the official engine reference and the installed Studio Assistant skills. Both answer with **no Studio open**.
+
+Ported from [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp) (MIT).
 
 ## Setup
 
