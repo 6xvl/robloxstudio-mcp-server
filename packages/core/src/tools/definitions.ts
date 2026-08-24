@@ -2112,6 +2112,73 @@ part(0,2,0,2,1,1,"b")`,
     inputSchema: { type: 'object', properties: {} }
   },
 
+  // === Selection and .rbxm round-trip ===
+  {
+    name: 'selection',
+    category: 'write',
+    description: 'Get, set, add to, remove from, or frame the Studio selection.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get', 'set', 'add', 'remove', 'frame'], description: 'Defaults to get.' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Instance paths for set/add/remove. Empty array with set clears.' },
+        path: { type: 'string', description: 'Instance to frame; required for frame.' },
+        padding: { type: 'number', description: 'Frame distance multiplier, 0 to 10. Defaults to 1.' },
+        from: { type: 'number', description: 'Compass angle in degrees to view from.' },
+        angleY: { type: 'number', description: 'Elevation in degrees, -89 to 89.' }
+      }
+    }
+  },
+  {
+    name: 'export_rbxm',
+    category: 'read',
+    description: 'Save instances as a real .rbxm via SerializationService — lossless, unlike export_build\'s compact JSON. target may be "server" to lift a model out of a running game.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instance_paths: { type: 'array', items: { type: 'string' }, description: 'Instances to serialize.' },
+        output_path: { type: 'string', description: 'Local file to write.' },
+        target: { type: 'string', enum: ['edit', 'server'], description: 'Which peer to read from; defaults to edit.' }
+      },
+      required: ['instance_paths', 'output_path']
+    }
+  },
+  {
+    name: 'import_rbxm',
+    category: 'write',
+    description: 'Load a .rbxm from a local path, an http(s) URL, or inline base64, under a chosen parent. Parenting is all-or-nothing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Local .rbxm file.' },
+            url: { type: 'string', description: 'http(s) URL, 50 MiB cap.' },
+            base64: { type: 'string', description: 'Inline rbxm bytes.' }
+          },
+          description: 'Exactly one of path, url, base64.'
+        },
+        parent_path: { type: 'string', description: 'Instance to parent the loaded instances under.' },
+        target: { type: 'string', enum: ['edit', 'server'], description: 'Which peer to load into; defaults to edit.' }
+      },
+      required: ['source', 'parent_path']
+    }
+  },
+  {
+    name: 'generate_model',
+    category: 'write',
+    description: 'Stage a Roblox model from a text prompt or an image, via GenerationService.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: 'Text description of the model.' },
+        assetId: { type: 'number', description: 'Image asset id to generate from instead of a prompt.' },
+        name: { type: 'string', description: 'Name for the staged model.' }
+      }
+    }
+  },
+
   // === Live VM evaluation (needs a running playtest) ===
   {
     name: 'eval_server_runtime',

@@ -14,6 +14,9 @@ import CaptureHandlers from "./handlers/CaptureHandlers";
 import InputHandlers from "./handlers/InputHandlers";
 import EvalRuntimeHandlers from "./handlers/EvalRuntimeHandlers";
 import LogHandlers from "./handlers/LogHandlers";
+import SelectionHandlers from "./handlers/SelectionHandlers";
+import SerializationHandlers from "./handlers/SerializationHandlers";
+import GenerateModelHandlers from "./handlers/GenerateModelHandlers";
 import { Connection, RequestPayload, PollResponse, ReadyResponse } from "../types";
 
 const instanceId = HttpService.GenerateGUID(false);
@@ -76,6 +79,11 @@ const routeMap: Record<string, Handler> = {
 	// execute-luau above, which is the plugin VM and gets a fresh copy of every module.
 	"/api/eval-runtime": EvalRuntimeHandlers.evalRuntime,
 	"/api/get-runtime-logs": LogHandlers.getRuntimeLogs,
+	"/api/set-selection": SelectionHandlers.setSelection,
+	"/api/focus-viewport": SelectionHandlers.focusViewport,
+	"/api/export-rbxm": SerializationHandlers.exportRbxm,
+	"/api/import-rbxm": SerializationHandlers.importRbxm,
+	"/api/generate-model": GenerateModelHandlers.generateModel,
 	"/api/undo": MetadataHandlers.undo,
 	"/api/redo": MetadataHandlers.redo,
 	"/api/bulk-set-attributes": MetadataHandlers.bulkSetAttributes,

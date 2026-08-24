@@ -170,6 +170,9 @@ local CaptureHandlers = TS.import(script, script.Parent, "handlers", "CaptureHan
 local InputHandlers = TS.import(script, script.Parent, "handlers", "InputHandlers")
 local EvalRuntimeHandlers = TS.import(script, script.Parent, "handlers", "EvalRuntimeHandlers")
 local LogHandlers = TS.import(script, script.Parent, "handlers", "LogHandlers")
+local SelectionHandlers = TS.import(script, script.Parent, "handlers", "SelectionHandlers")
+local SerializationHandlers = TS.import(script, script.Parent, "handlers", "SerializationHandlers")
+local GenerateModelHandlers = TS.import(script, script.Parent, "handlers", "GenerateModelHandlers")
 local instanceId = HttpService:GenerateGUID(false)
 local assignedRole
 local function detectRole()
@@ -223,6 +226,11 @@ local routeMap = {
 	["/api/execute-luau"] = MetadataHandlers.executeLuau,
 	["/api/eval-runtime"] = EvalRuntimeHandlers.evalRuntime,
 	["/api/get-runtime-logs"] = LogHandlers.getRuntimeLogs,
+	["/api/set-selection"] = SelectionHandlers.setSelection,
+	["/api/focus-viewport"] = SelectionHandlers.focusViewport,
+	["/api/export-rbxm"] = SerializationHandlers.exportRbxm,
+	["/api/import-rbxm"] = SerializationHandlers.importRbxm,
+	["/api/generate-model"] = GenerateModelHandlers.generateModel,
 	["/api/undo"] = MetadataHandlers.undo,
 	["/api/redo"] = MetadataHandlers.redo,
 	["/api/bulk-set-attributes"] = MetadataHandlers.bulkSetAttributes,
@@ -2043,6 +2051,211 @@ return {
         </Item>
         <Item class="ModuleScript" referent="9">
           <Properties>
+            <string name="Name">GenerateModelHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local Utils = TS.import(script, script.Parent.Parent, "Utils")
+local Recording = TS.import(script, script.Parent.Parent, "Recording")
+local GenerationService = game:GetService("GenerationService")
+local HttpService = game:GetService("HttpService")
+local ServerStorage = game:GetService("ServerStorage")
+local Selection = game:GetService("Selection")
+local _binding = Utils
+local getInstancePath = _binding.getInstancePath
+local _binding_1 = Recording
+local beginRecording = _binding_1.beginRecording
+local finishRecording = _binding_1.finishRecording
+local OUTPUT_FOLDER_NAME = "__MCPGeneratedModels"
+local GENERATE_MODEL_MODERATION_RETRIES = 2
+local function fail(message)
+	return {
+		success = false,
+		error = message,
+	}
+end
+local function contentFromAssetId(assetId)
+	return Content.fromUri(`rbxassetid://{assetId}`)
+end
+local function imageToContent(image)
+	local payload = image
+	local _condition = payload.kind ~= "asset"
+	if not _condition then
+		local _asset_id = payload.asset_id
+		_condition = not (type(_asset_id) == "number")
+		if not _condition then
+			_condition = payload.asset_id <= 0
+		end
+	end
+	if _condition then
+		error("generate_model image input must be an asset-backed Roblox image ID", 0)
+	end
+	return contentFromAssetId(math.floor(payload.asset_id))
+end
+local function outputFolder()
+	local existing = ServerStorage:FindFirstChild(OUTPUT_FOLDER_NAME)
+	if existing ~= nil then
+		if existing:IsA("Folder") then
+			return existing
+		end
+		return `game.ServerStorage.{OUTPUT_FOLDER_NAME} already exists and is not a Folder`
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = OUTPUT_FOLDER_NAME
+	folder.Parent = ServerStorage
+	return folder
+end
+local function sanitizeName(value)
+	local _value = value
+	local _condition = type(_value) == "string"
+	if _condition then
+		_condition = value ~= ""
+	end
+	local raw = if _condition then value else "GeneratedModel"
+	local name = (string.gsub(raw, "[%c]", " "))
+	name = (string.gsub((string.gsub(name, "^%s+", "")), "%s+$", ""))
+	if name == "" then
+		name = "GeneratedModel"
+	end
+	if #name > 80 then
+		name = string.sub(name, 1, 80)
+	end
+	return name
+end
+local function uniqueName(parent, baseName)
+	if parent:FindFirstChild(baseName) == nil then
+		return baseName
+	end
+	for i = 2, 999 do
+		local candidate = `{baseName}_{i}`
+		if parent:FindFirstChild(candidate) == nil then
+			return candidate
+		end
+	end
+	return `{baseName}_{HttpService:GenerateGUID(false)}`
+end
+local function buildInputs(requestData)
+	local inputs = {}
+	local prompt = requestData.prompt
+	if type(prompt) == "string" and prompt ~= "" then
+		inputs.TextPrompt = prompt
+	end
+	local image = requestData.image
+	if image ~= nil then
+		inputs.Image = imageToContent(image)
+	end
+	local size = requestData.size
+	if size ~= nil then
+		local _condition = size.x
+		if _condition == nil then
+			_condition = 1
+		end
+		local _condition_1 = size.y
+		if _condition_1 == nil then
+			_condition_1 = 1
+		end
+		local _condition_2 = size.z
+		if _condition_2 == nil then
+			_condition_2 = 1
+		end
+		inputs.Size = Vector3.new(_condition, _condition_1, _condition_2)
+	end
+	local maxTriangles = requestData.max_triangles
+	if type(maxTriangles) == "number" then
+		inputs.MaxTriangles = math.floor(maxTriangles)
+	end
+	local generateTextures = requestData.generate_textures
+	if type(generateTextures) == "boolean" then
+		inputs.GenerateTextures = generateTextures
+	end
+	return inputs
+end
+local function buildSchema(requestData)
+	local schemaGroups = requestData.schema_groups
+	if schemaGroups ~= nil then
+		return {
+			SchemaDefinition = {
+				Groups = schemaGroups,
+			},
+		}
+	end
+	local _schema = requestData.schema
+	local _condition = type(_schema) == "string"
+	if _condition then
+		_condition = requestData.schema ~= ""
+	end
+	local schema = if _condition then requestData.schema else "Body1"
+	return {
+		PredefinedSchema = schema,
+	}
+end
+local function isModerationFailure(value)
+	return (string.find(tostring(value), "Moderation failed", 1, true)) ~= nil
+end
+local function generateModel(requestData)
+	local inputOk, inputsOrError = pcall(function()
+		return buildInputs(requestData)
+	end)
+	if not inputOk then
+		return fail(`Failed to prepare model input: {tostring(inputsOrError)}`)
+	end
+	local schema = buildSchema(requestData)
+	local recordingId = beginRecording("Generate model")
+	local createdModel
+	local generateOk = false
+	local generateResult
+	for attempt = 0, GENERATE_MODEL_MODERATION_RETRIES do
+		local ok, result = pcall(function()
+			return GenerationService:GenerateModelAsync(inputsOrError, schema, {})
+		end)
+		generateOk = ok
+		generateResult = result
+		if ok or not isModerationFailure(result) or attempt == GENERATE_MODEL_MODERATION_RETRIES then
+			break
+		end
+		task.wait(0.25)
+	end
+	if not generateOk then
+		finishRecording(recordingId, false)
+		if isModerationFailure(generateResult) then
+			return fail("Moderation failed after 3 attempts.")
+		end
+		return fail(tostring(generateResult))
+	end
+	local _generateResult = generateResult
+	local _condition = not (typeof(_generateResult) == "Instance")
+	if not _condition then
+		_condition = not generateResult:IsA("Model")
+	end
+	if _condition then
+		finishRecording(recordingId, false)
+		return fail("GenerationService did not return a Model.")
+	end
+	createdModel = generateResult
+	local folder = outputFolder()
+	if type(folder) == "string" then
+		createdModel:Destroy()
+		finishRecording(recordingId, false)
+		return fail(folder)
+	end
+	createdModel.Name = uniqueName(folder, sanitizeName(requestData.name))
+	createdModel.Parent = folder
+	pcall(function()
+		return Selection:Set({ createdModel })
+	end)
+	finishRecording(recordingId, true)
+	return {
+		success = true,
+		modelPath = getInstancePath(createdModel),
+	}
+end
+return {
+	generateModel = generateModel,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
             <string name="Name">InputHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
 local function getVIM()
@@ -2195,7 +2408,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="11">
           <Properties>
             <string name="Name">InstanceHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2702,7 +2915,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">LogHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2728,7 +2941,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">MetadataHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3311,7 +3524,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">PropertyHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3563,7 +3776,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="14">
+        <Item class="ModuleScript" referent="15">
           <Properties>
             <string name="Name">QueryHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -4579,7 +4792,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="15">
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">ScriptHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5275,7 +5488,379 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="16">
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">SelectionHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local Utils = TS.import(script, script.Parent.Parent, "Utils")
+local Selection = game:GetService("Selection")
+local _binding = Utils
+local getInstancePath = _binding.getInstancePath
+local getInstanceByPath = _binding.getInstanceByPath
+-- Selection and viewport framing, ported from Chrrxs/robloxstudio-mcp (MIT). Upstream keeps
+-- these in MetadataHandlers; they live apart here so our copy of that file stays ours.
+local function setSelection(requestData)
+	local rawPaths = requestData.paths
+	if not (type(rawPaths) == "table") then
+		return {
+			error = "paths is required (an empty array clears in set mode)",
+		}
+	end
+	local _condition = (requestData.mode)
+	if _condition == nil then
+		_condition = "set"
+	end
+	local mode = _condition
+	if mode ~= "set" and mode ~= "add" and mode ~= "remove" then
+		return {
+			error = `mode must be "set", "add" or "remove" (got: {mode})`,
+		}
+	end
+	local paths = rawPaths
+	if #paths == 0 and mode ~= "set" then
+		return {
+			error = `paths cannot be empty in {mode} mode`,
+		}
+	end
+	local targets = {}
+	local missing = {}
+	for _, entry in paths do
+		if not (type(entry) == "string") or entry == "" then
+			return {
+				error = "paths must contain non-empty instance path strings",
+			}
+		end
+		local instance = getInstanceByPath(entry)
+		if instance then
+			table.insert(targets, instance)
+		else
+			table.insert(missing, entry)
+		end
+	end
+	local clearsSelection = mode == "set" and #paths == 0
+	if #targets == 0 and not clearsSelection then
+		return {
+			error = "No matching instances found for any path",
+			missingPaths = missing,
+		}
+	end
+	local ok, err = pcall(function()
+		if mode == "add" then
+			Selection:Add(targets)
+		elseif mode == "remove" then
+			Selection:Remove(targets)
+		else
+			Selection:Set(targets)
+		end
+	end)
+	if not ok then
+		return {
+			error = `Selection.{mode} failed: {tostring(err)}`,
+		}
+	end
+	return {
+		success = true,
+		mode = mode,
+		selected = #targets,
+		missingPaths = missing,
+		message = if clearsSelection then "Selection cleared" elseif mode == "remove" then `Deselected {#targets} object(s)` else `{#targets} object(s) {if mode == "add" then "added to" else "in"} the selection`,
+	}
+end
+local function focusViewport(requestData)
+	local instancePath = requestData.path
+	if not (instancePath ~= "" and instancePath) then
+		return {
+			error = "path is required (the instance to frame)",
+		}
+	end
+	local instance = getInstanceByPath(instancePath)
+	if not instance then
+		return {
+			error = `Instance not found: {instancePath}`,
+		}
+	end
+	local workspace = game:GetService("Workspace")
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return {
+			error = "Workspace.CurrentCamera is unavailable right now",
+		}
+	end
+	local _condition = tonumber(requestData.padding)
+	if _condition == nil then
+		_condition = 1
+	end
+	local padding = _condition
+	if padding <= 0 or padding > 10 then
+		return {
+			error = "padding must be greater than 0 and at most 10",
+		}
+	end
+	local compassOverride = if requestData.from == nil then nil else tonumber(requestData.from)
+	if requestData.from ~= nil and compassOverride == nil then
+		return {
+			error = "from must be a compass angle in degrees",
+		}
+	end
+	local elevationOverride = if requestData.angleY == nil then nil else tonumber(requestData.angleY)
+	if requestData.angleY ~= nil and (elevationOverride == nil or elevationOverride < -89 or elevationOverride > 89) then
+		return {
+			error = "angleY must be between -89 and 89",
+		}
+	end
+	local ok, err = pcall(function()
+		local boundsCF
+		local boundsSize
+		if instance:IsA("Model") then
+			boundsCF, boundsSize = instance:GetBoundingBox()
+		elseif instance:IsA("BasePart") then
+			boundsCF = instance.CFrame
+			boundsSize = instance.Size
+		else
+			return error(`Cannot frame a {instance.ClassName}: it has no 3D bounding box. Frame a part or model instead.`)
+		end
+		local center = boundsCF.Position
+		local direction = camera.CFrame.LookVector * (-1)
+		local currentHorizontal = Vector3.new(direction.X, 0, direction.Z)
+		local horizontalDirection = if currentHorizontal.Magnitude < 0.001 then Vector3.new(1, 0, 0) else currentHorizontal.Unit
+		if compassOverride ~= nil then
+			local yaw = math.rad(compassOverride)
+			horizontalDirection = Vector3.new(math.cos(yaw), 0, math.sin(yaw))
+		end
+		local vertical = direction.Y
+		local horizontalMagnitude = math.sqrt(math.max(0, 1 - vertical * vertical))
+		if elevationOverride ~= nil then
+			local pitch = math.rad(elevationOverride)
+			vertical = math.sin(pitch)
+			horizontalMagnitude = math.cos(pitch)
+		end
+		local _horizontalDirection = horizontalDirection
+		local _horizontalMagnitude = horizontalMagnitude
+		local _vector3 = Vector3.new(0, vertical, 0)
+		direction = (_horizontalDirection * _horizontalMagnitude + _vector3).Unit
+		camera.CameraType = Enum.CameraType.Scriptable
+		local _direction = direction
+		local _arg0 = math.max(boundsSize.Magnitude, 1)
+		camera.CFrame = CFrame.lookAt(center + (_direction * _arg0), center)
+		camera.Focus = CFrame.new(center)
+		camera:ZoomToExtents(boundsCF, boundsSize)
+		if padding ~= 1 then
+			local fittedOffset = camera.CFrame.Position - center
+			local _arg0_1 = fittedOffset * padding
+			camera.CFrame = CFrame.lookAt(center + _arg0_1, center)
+		end
+		camera.Focus = CFrame.new(center)
+	end)
+	if not ok then
+		return {
+			error = `focus failed: {tostring(err)}`,
+		}
+	end
+	return {
+		success = true,
+		path = getInstancePath(instance),
+		cameraPosition = {
+			X = camera.CFrame.Position.X,
+			Y = camera.CFrame.Position.Y,
+			Z = camera.CFrame.Position.Z,
+		},
+	}
+end
+return {
+	setSelection = setSelection,
+	focusViewport = focusViewport,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">SerializationHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local RunService = TS.import(script, script.Parent.Parent.Parent, "node_modules", "@rbxts", "services").RunService
+local Utils = TS.import(script, script.Parent.Parent, "Utils")
+local Recording = TS.import(script, script.Parent.Parent, "Recording")
+-- SerializationService:SerializeInstancesAsync / DeserializeInstancesAsync were
+-- added in engine v668 and are PluginSecurity. They are not in @rbxts/types yet,
+-- so we resolve the service through an untyped GetService cast and treat the
+-- methods as opaque (buffer in / buffer out).
+local SerializationService = game:GetService("SerializationService")
+-- EncodingService:Base64Encode / Base64Decode take and return `buffer` (not
+-- `string`). The signature is in @rbxts/types under None.d.ts so a normal
+-- GetService("EncodingService") would already give correct types, but @rbxts
+-- generates a per-service nominal interface and roblox.d.ts doesn't re-export
+-- EncodingService from the services barrel module - so the typed cast below
+-- matches what GetService would give us if it did.
+local EncodingService = game:GetService("EncodingService")
+local _binding = Utils
+local getInstanceByPath = _binding.getInstanceByPath
+local getInstancePath = _binding.getInstancePath
+local _binding_1 = Recording
+local beginRecording = _binding_1.beginRecording
+local finishRecording = _binding_1.finishRecording
+local function exportRbxm(requestData)
+	local instancePaths = requestData.instance_paths
+	if not instancePaths or not (type(instancePaths) == "table") or #instancePaths == 0 then
+		return {
+			error = "instance_paths must be a non-empty array",
+		}
+	end
+	local instances = {}
+	for _, p in instancePaths do
+		local inst = getInstanceByPath(p)
+		if not inst then
+			return {
+				error = `instance not found: {p}`,
+			}
+		end
+		table.insert(instances, inst)
+	end
+	local serializeOk, serializeResult = pcall(function()
+		return SerializationService:SerializeInstancesAsync(instances)
+	end)
+	if not serializeOk then
+		return {
+			error = `SerializeInstancesAsync failed: {tostring(serializeResult)}`,
+		}
+	end
+	local buf = serializeResult
+	local encodeOk, encodeResult = pcall(function()
+		return EncodingService:Base64Encode(buf)
+	end)
+	if not encodeOk then
+		return {
+			error = `EncodingService:Base64Encode failed: {tostring(encodeResult)}`,
+		}
+	end
+	-- Base64Encode returns a buffer of ASCII bytes; convert to a Lua string so
+	-- HttpService:JSONEncode (called by the harness in Communication.ts) accepts
+	-- it. Base64 is by definition pure ASCII so this round-trips cleanly.
+	local base64Str = buffer.tostring(encodeResult)
+	return {
+		base64 = base64Str,
+		instance_count = #instances,
+	}
+end
+local function importRbxm(requestData)
+	local b64 = requestData.base64
+	local parentPath = requestData.parent_path
+	local _condition = (requestData.source_label)
+	if _condition == nil then
+		_condition = "unknown"
+	end
+	local sourceLabel = _condition
+	if not (b64 ~= "" and b64) or not (type(b64) == "string") then
+		return {
+			error = "base64 payload is required",
+		}
+	end
+	if not (parentPath ~= "" and parentPath) or not (type(parentPath) == "string") then
+		return {
+			error = "parent_path is required",
+		}
+	end
+	local parentInstance = getInstanceByPath(parentPath)
+	if not parentInstance then
+		return {
+			error = `parent instance not found: {parentPath}`,
+		}
+	end
+	-- b64 is an ASCII-only Lua string from the wire; lift it into a buffer for
+	-- EncodingService:Base64Decode, which returns a buffer of raw rbxm bytes
+	-- ready for DeserializeInstancesAsync.
+	local b64BufOk, b64BufResult = pcall(function()
+		return buffer.fromstring(b64)
+	end)
+	if not b64BufOk then
+		return {
+			error = `buffer.fromstring(base64) failed: {tostring(b64BufResult)}`,
+		}
+	end
+	local decodeOk, decodeResult = pcall(function()
+		return EncodingService:Base64Decode(b64BufResult)
+	end)
+	if not decodeOk then
+		return {
+			error = `EncodingService:Base64Decode failed: {tostring(decodeResult)}`,
+		}
+	end
+	local buf = decodeResult
+	local deserOk, deserResult = pcall(function()
+		return SerializationService:DeserializeInstancesAsync(buf)
+	end)
+	if not deserOk then
+		return {
+			error = `DeserializeInstancesAsync failed: {tostring(deserResult)}`,
+		}
+	end
+	local deserialized = deserResult
+	-- All-or-nothing parenting. Track every instance we've attached and roll back
+	-- (unparent + Destroy) if any later one fails - partial imports leave the DM
+	-- in a worse state than failing cleanly.
+	local isEdit = not RunService:IsRunning()
+	local recordingId = if isEdit then beginRecording(`Import rbxm`) else nil
+	local attached = {}
+	local failureMessage
+	for _, inst in deserialized do
+		local parentOk, parentErr = pcall(function()
+			inst.Parent = parentInstance
+		end)
+		if not parentOk then
+			failureMessage = `failed to parent {inst.Name} ({inst.ClassName}) under {parentPath}: {tostring(parentErr)}`
+			break
+		end
+		table.insert(attached, inst)
+	end
+	if failureMessage ~= nil then
+		for _, inst in attached do
+			pcall(function()
+				inst.Parent = nil
+				inst:Destroy()
+			end)
+		end
+		-- Also destroy any unparented deserialized instances so they don't leak.
+		for _, inst in deserialized do
+			if inst.Parent == nil then
+				pcall(function()
+					return inst:Destroy()
+				end)
+			end
+		end
+		finishRecording(recordingId, false)
+		return {
+			error = failureMessage,
+		}
+	end
+	local names = {}
+	local paths = {}
+	for _, inst in attached do
+		local _name = inst.Name
+		table.insert(names, _name)
+		local _arg0 = getInstancePath(inst)
+		table.insert(paths, _arg0)
+	end
+	-- The recording shows "MCP: Import rbxm" in Studio's undo stack -
+	-- ChangeHistoryService doesn't expose a way to set a richer displayName
+	-- after TryBeginRecording, so the count/source only land in the JSON response.
+	finishRecording(recordingId, true)
+	return {
+		instance_count = #attached,
+		instance_names = names,
+		instance_paths = paths,
+		parent_path = parentPath,
+		source = sourceLabel,
+	}
+end
+return {
+	exportRbxm = exportRbxm,
+	importRbxm = importRbxm,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="19">
           <Properties>
             <string name="Name">TestHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5590,7 +6175,7 @@ return {
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">LuauExec</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6024,7 +6609,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Recording</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6054,7 +6639,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">RuntimeLogBuffer</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6309,7 +6894,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">State</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6405,7 +6990,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">UI</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -7125,7 +7710,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">Utils</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -7662,11 +8247,11 @@ return {
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="26">
+    <Item class="Folder" referent="29">
       <Properties>
         <string name="Name">include</string>
       </Properties>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="26">
         <Properties>
           <string name="Name">Promise</string>
           <string name="Source"><![CDATA[--[[
@@ -9740,7 +10325,7 @@ return Promise
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">RuntimeLib</string>
           <string name="Source"><![CDATA[local Promise = require(script.Parent.Promise)
@@ -10007,15 +10592,15 @@ return TS
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="27">
+    <Item class="Folder" referent="30">
       <Properties>
         <string name="Name">node_modules</string>
       </Properties>
-      <Item class="Folder" referent="28">
+      <Item class="Folder" referent="31">
         <Properties>
           <string name="Name">@rbxts</string>
         </Properties>
-      <Item class="ModuleScript" referent="25">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">services</string>
           <string name="Source"><![CDATA[return setmetatable({}, {

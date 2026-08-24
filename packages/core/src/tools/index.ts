@@ -1698,6 +1698,10 @@ export class RobloxStudioTools {
     return { content: [{ type: 'text', text: JSON.stringify(response) }] };
   }
 
+  private jsonResult(body: unknown) {
+    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
   /**
    * Same as passthrough, but addressed to ONE peer instead of the edit DataModel.
    *
@@ -1796,6 +1800,169 @@ export class RobloxStudioTools {
   wallyList() { return this.passthrough('/api/wally-list'); }
   packagePublish() { return this.passthrough('/api/package-publish'); }
   physicsBake() { return this.passthrough('/api/physics-bake'); }
+
+  /** peerRequest's raw form, for callers that read fields off the reply before wrapping it. */
+  private async peerRaw(endpoint: string, peer: string, body: any = {}): Promise<any> {
+    return this.client.request(endpoint, body, peer);
+  }
+
+  // --- Selection and framing ---------------------------------------------------
+
+  /**
+   * Get, set, or frame the Studio selection.
+   *
+   * One tool rather than three because they are the same noun, and `frame` only makes
+   * sense against something selected or named.
+   */
+  async selection(action: string, body: any = {}) {
+    if (action === 'get' || action === undefined) {
+      return this.passthrough('/api/get-selection');
+    }
+    if (action === 'set' || action === 'add' || action === 'remove') {
+      return this.passthrough('/api/set-selection', { paths: body.paths, mode: action });
+    }
+    if (action === 'frame') {
+      return this.passthrough('/api/focus-viewport', {
+        path: body.path, padding: body.padding, from: body.from, angleY: body.angleY,
+      });
+    }
+    throw new Error(`selection action must be get, set, add, remove or frame (got: ${action})`);
+  }
+
+  // --- .rbxm round-trip --------------------------------------------------------
+
+  /**
+   * Save instances as a real .rbxm, the format Studio itself writes.
+   *
+   * SerializationService round-trips actual instances, so a model comes back with every
+   * property, script, constraint and attribute intact -- unlike export_build, which is a
+   * compact part-and-colour JSON that is deliberately lossy.
+   *
+   * `target` allows `server` so a model can be lifted out of a RUNNING game, which is the
+   * only way to capture something the game built at runtime.
+   */
+  async exportRbxm(instancePaths: string[], outputPath: string, target?: string) {
+    if (!Array.isArray(instancePaths) || instancePaths.length === 0) {
+      throw new Error('instance_paths must be a non-empty array for export_rbxm');
+    }
+    if (!outputPath || typeof outputPath !== 'string') {
+      throw new Error('output_path is required for export_rbxm');
+    }
+    const peer = target || 'edit';
+    if (peer !== 'edit' && peer !== 'server') {
+      throw new Error(`export_rbxm target must be "edit" or "server" (got: ${peer})`);
+    }
+
+    type ExportReply = { error?: string; base64?: string; instance_count?: number };
+    const response: ExportReply = await this.peerRaw('/api/export-rbxm', peer, { instance_paths: instancePaths });
+
+    if (response.error) return this.jsonResult({ error: response.error });
+    if (!response.base64) return this.jsonResult({ error: 'plugin returned no base64 payload' });
+
+    const bytes = Buffer.from(response.base64, 'base64');
+    const resolved = path.resolve(outputPath);
+    try {
+      fs.mkdirSync(path.dirname(resolved), { recursive: true });
+      fs.writeFileSync(resolved, bytes);
+    } catch (err) {
+      return this.jsonResult({ error: `failed to write ${resolved}: ${(err as Error).message}` });
+    }
+
+    return this.jsonResult({
+      bytes_written: bytes.length,
+      instance_count: response.instance_count ?? instancePaths.length,
+      output_path: resolved,
+    });
+  }
+
+  /**
+   * Load a .rbxm from disk, a URL, or inline base64 under a chosen parent.
+   *
+   * Exactly one source, checked rather than preferred: silently ignoring two would make a
+   * typo look like a working import of the wrong thing. Parenting is all-or-nothing on the
+   * plugin side, so a partial import cannot be left behind.
+   */
+  async importRbxm(
+    source: { path?: string; url?: string; base64?: string } | undefined,
+    parentPath: string,
+    target?: string,
+  ) {
+    if (!source || typeof source !== 'object') throw new Error('source is required for import_rbxm');
+    if (!parentPath || typeof parentPath !== 'string') throw new Error('parent_path is required for import_rbxm');
+
+    const peer = target || 'edit';
+    if (peer !== 'edit' && peer !== 'server') {
+      throw new Error(`import_rbxm target must be "edit" or "server" (got: ${peer})`);
+    }
+
+    const modes = ['path', 'url', 'base64'].filter((k) => (source as Record<string, unknown>)[k] !== undefined);
+    if (modes.length !== 1) {
+      throw new Error(`source must contain exactly one of { path, url, base64 } (got: ${modes.join(', ') || 'none'})`);
+    }
+
+    // Matches the server's own express.json('50mb') cap, so a payload that would be
+    // refused at the next hop is refused here with a message that names the size.
+    const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+    let bytes: Buffer;
+    let sourceLabel: string;
+
+    if (source.path !== undefined) {
+      const resolved = path.resolve(source.path);
+      try {
+        bytes = fs.readFileSync(resolved);
+      } catch (err) {
+        return this.jsonResult({ error: `failed to read ${resolved}: ${(err as Error).message}` });
+      }
+      sourceLabel = resolved;
+    } else if (source.url !== undefined) {
+      // http(s) only. Blocks file://, ftp:// and friends from being read through a tool
+      // whose job is to fetch a model. Internal addresses are NOT blocked: a local server
+      // has real reasons to reach localhost.
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(source.url);
+      } catch {
+        return this.jsonResult({ error: `import_rbxm url is not a valid URL: ${source.url}` });
+      }
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+        return this.jsonResult({ error: `import_rbxm url must use http(s); got ${parsedUrl.protocol}` });
+      }
+      try {
+        const res = await fetch(source.url);
+        if (!res.ok) {
+          return this.jsonResult({ error: `fetch ${source.url} returned ${res.status}: ${(await res.text()).slice(0, 500)}` });
+        }
+        const claimed = Number(res.headers.get('content-length') ?? '0');
+        if (claimed > MAX_IMPORT_BYTES) {
+          return this.jsonResult({ error: `fetch ${source.url}: content-length ${claimed} exceeds ${MAX_IMPORT_BYTES} byte cap` });
+        }
+        const arr = await res.arrayBuffer();
+        // Checked again after download: content-length is a claim, not a measurement.
+        if (arr.byteLength > MAX_IMPORT_BYTES) {
+          return this.jsonResult({ error: `fetch ${source.url}: downloaded ${arr.byteLength} bytes exceeds ${MAX_IMPORT_BYTES} byte cap` });
+        }
+        bytes = Buffer.from(arr);
+      } catch (err) {
+        return this.jsonResult({ error: `fetch ${source.url} failed: ${(err as Error).message}` });
+      }
+      sourceLabel = source.url;
+    } else {
+      bytes = Buffer.from(source.base64 as string, 'base64');
+      sourceLabel = `base64(${bytes.length}B)`;
+    }
+
+    const response = await this.peerRaw('/api/import-rbxm', peer, {
+      base64: bytes.toString('base64'),
+      parent_path: parentPath,
+      source_label: sourceLabel,
+    });
+    return this.jsonResult(response);
+  }
+
+  /** Stage a Roblox model from text or an image, via GenerationService. */
+  generateModel(body: any) {
+    return this.passthrough('/api/generate-model', body);
+  }
 
   // --- Live VM evaluation ------------------------------------------------------
 
