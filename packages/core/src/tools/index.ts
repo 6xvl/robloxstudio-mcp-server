@@ -1698,6 +1698,35 @@ export class RobloxStudioTools {
     return { content: [{ type: 'text', text: JSON.stringify(response) }] };
   }
 
+  /**
+   * Same as passthrough, but addressed to ONE peer instead of the edit DataModel.
+   *
+   * A playtest forks the DataModel and the plugin runs again in each fork, so a live place
+   * is several peers at once: `edit`, `server`, and `client-1..N`. Anything that has to see
+   * the running game -- its require cache, its log buffer, its frame timings -- has to name
+   * which of them it means, because the edit peer can answer none of it.
+   *
+   * The peer names ARE the bridge's roles, so this is just the role parameter the transport
+   * already carries. A name with no peer behind it fails with the bridge's own timeout, and
+   * the message below is what turns that into something a caller can act on.
+   */
+  private async peerRequest(endpoint: string, peer: string, body: any = {}) {
+    try {
+      const response = await this.client.request(endpoint, body, peer);
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('timeout') || message.includes('disconnected')) {
+        throw new Error(
+          `No "${peer}" peer answered. That peer only exists while a playtest is running -- `
+          + `start one (or use start_playtest), then retry. Connected peers: `
+          + `${this.bridge.getInstances().map(i => i.role).join(', ') || 'none'}.`,
+        );
+      }
+      throw error;
+    }
+  }
+
   // Health
   getHandlerHealth() { return this.passthrough('/api/health'); }
 
@@ -1767,6 +1796,53 @@ export class RobloxStudioTools {
   wallyList() { return this.passthrough('/api/wally-list'); }
   packagePublish() { return this.passthrough('/api/package-publish'); }
   physicsBake() { return this.passthrough('/api/physics-bake'); }
+
+  // --- Live VM evaluation ------------------------------------------------------
+
+  /**
+   * Luau in the running SERVER VM, sharing that VM's require cache.
+   *
+   * The difference from execute_luau is the whole reason this exists. execute_luau runs in
+   * the plugin VM against a fresh ModuleScript, so `require(SomeModule)` hands back a new
+   * copy -- every table the running game has mutated since it started is invisible, and a
+   * probe written after an edit reads the module as it is on disk rather than as the game
+   * is holding it. This runs inside the game's own VM instead, so it sees the real thing.
+   */
+  evalServerRuntime(code: string) {
+    return this.peerRequest('/api/eval-runtime', 'server', { code });
+  }
+
+  /** The same, in a client VM. `target` names which client; there is one peer per player. */
+  evalClientRuntime(code: string, target?: string) {
+    return this.peerRequest('/api/eval-runtime', target || 'client-1', { code });
+  }
+
+  /**
+   * Recent output from one peer, or all of them.
+   *
+   * Per-peer matters: a value that differs between server and client is the shape of every
+   * replication bug, and a single merged log cannot show you which side printed what.
+   * `since` is a sequence cursor -- pass back the nextSince from the last read and you get
+   * only what has appeared since, rather than re-reading the whole buffer.
+   */
+  async getRuntimeLogs(target?: string, since?: number, tail?: number, filter?: string) {
+    const peers = target && target !== 'all'
+      ? [target]
+      : ['edit', ...this.bridge.getInstances().map(i => i.role).filter(r => r !== 'edit')];
+
+    const body = { since, tail, filter };
+    const results: Record<string, unknown> = {};
+    for (const peer of [...new Set(peers)]) {
+      try {
+        results[peer] = await this.client.request('/api/get-runtime-logs', body, peer);
+      } catch (error) {
+        // One dead peer must not lose the peers that DID answer -- with `all`, the
+        // interesting case is usually a playtest half up.
+        results[peer] = { error: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    return { content: [{ type: 'text', text: JSON.stringify({ peers: results }) }] };
+  }
 
   // --- Reference documentation -------------------------------------------------
   // Neither of these touches the plugin: one reads create.roblox.com, the other reads

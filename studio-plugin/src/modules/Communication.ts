@@ -12,6 +12,8 @@ import BuildHandlers from "./handlers/BuildHandlers";
 import AssetHandlers from "./handlers/AssetHandlers";
 import CaptureHandlers from "./handlers/CaptureHandlers";
 import InputHandlers from "./handlers/InputHandlers";
+import EvalRuntimeHandlers from "./handlers/EvalRuntimeHandlers";
+import LogHandlers from "./handlers/LogHandlers";
 import { Connection, RequestPayload, PollResponse, ReadyResponse } from "../types";
 
 const instanceId = HttpService.GenerateGUID(false);
@@ -70,6 +72,10 @@ const routeMap: Record<string, Handler> = {
 	"/api/get-tagged": MetadataHandlers.getTagged,
 	"/api/get-selection": MetadataHandlers.getSelection,
 	"/api/execute-luau": MetadataHandlers.executeLuau,
+	// Runs in the LIVE server or client VM, sharing that VM's require cache -- unlike
+	// execute-luau above, which is the plugin VM and gets a fresh copy of every module.
+	"/api/eval-runtime": EvalRuntimeHandlers.evalRuntime,
+	"/api/get-runtime-logs": LogHandlers.getRuntimeLogs,
 	"/api/undo": MetadataHandlers.undo,
 	"/api/redo": MetadataHandlers.redo,
 	"/api/bulk-set-attributes": MetadataHandlers.bulkSetAttributes,

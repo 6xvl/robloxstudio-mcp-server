@@ -2112,6 +2112,47 @@ part(0,2,0,2,1,1,"b")`,
     inputSchema: { type: 'object', properties: {} }
   },
 
+  // === Live VM evaluation (needs a running playtest) ===
+  {
+    name: 'eval_server_runtime',
+    category: 'write',
+    description: 'Run Luau in the live SERVER VM, sharing its require cache. Unlike execute_luau (plugin VM, fresh module copies), this sees the running game\'s mutated module state. Needs a playtest.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'Luau; return a value to include it in the result.' }
+      },
+      required: ['code']
+    }
+  },
+  {
+    name: 'eval_client_runtime',
+    category: 'write',
+    description: 'Run Luau in a live CLIENT VM, sharing its require cache. Needs a playtest.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'Luau; return a value to include it in the result.' },
+        target: { type: 'string', description: 'Client peer, e.g. client-1. Defaults to client-1.' }
+      },
+      required: ['code']
+    }
+  },
+  {
+    name: 'get_runtime_logs',
+    category: 'read',
+    description: 'Read recent output PER PEER (edit, server, client-N, or all). A value that differs between server and client is the shape of every replication bug, and a merged log cannot show which side printed it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'edit, server, client-N, or all. Defaults to all.' },
+        since: { type: 'number', description: 'Sequence cursor; pass back nextSince from the previous read.' },
+        tail: { type: 'number', description: 'Last N entries after filtering.' },
+        filter: { type: 'string', description: 'Literal message substring, applied before tail.' }
+      }
+    }
+  },
+
   // === Reference documentation (no Studio connection needed) ===
   {
     name: 'get_roblox_docs',

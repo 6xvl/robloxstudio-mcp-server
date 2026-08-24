@@ -164,6 +164,9 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   wally_list: (tools) => tools.wallyList(),
   package_publish: (tools) => tools.packagePublish(),
   physics_bake: (tools) => tools.physicsBake(),
+  eval_server_runtime: (tools, body) => tools.evalServerRuntime(body.code),
+  eval_client_runtime: (tools, body) => tools.evalClientRuntime(body.code, body.target),
+  get_runtime_logs: (tools, body) => tools.getRuntimeLogs(body.target, body.since, body.tail, body.filter),
   get_roblox_docs: (tools, body) => tools.getRobloxDocs(body.name, body.doc_type, body.section),
   get_roblox_skills: (tools, body) => tools.getRobloxSkills(body.action, body.name),
 };

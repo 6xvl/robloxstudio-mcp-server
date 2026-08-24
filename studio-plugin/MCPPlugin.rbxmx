@@ -6,11 +6,32 @@
       <token name="RunContext">0</token>
       <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
 local TS = require(script.include.RuntimeLib)
+local RunService = TS.import(script, script, "node_modules", "@rbxts", "services").RunService
 local State = TS.import(script, script, "modules", "State")
 local UI = TS.import(script, script, "modules", "UI")
 local Communication = TS.import(script, script, "modules", "Communication")
+local RuntimeLogBuffer = TS.import(script, script, "modules", "RuntimeLogBuffer")
+local _EvalBridges = TS.import(script, script, "modules", "EvalBridges")
+local cleanupLegacyEditBridges = _EvalBridges.cleanupLegacyEditBridges
+local ensureRuntimeBridgeInstalled = _EvalBridges.ensureRuntimeBridgeInstalled
+-- Attach the per-peer LogService listener before anything else, so boot-time prints from
+-- the place's own scripts are captured rather than missed. Idempotent.
+RuntimeLogBuffer.install()
 UI.init(plugin)
 local elements = UI.getElements()
+-- WHICH DATAMODEL THIS COPY OF THE PLUGIN IS IN. A playtest forks the DataModel, and the
+-- plugin runs again in each fork -- so there is one plugin instance in edit, one in the
+-- play server, and one per play client. Everything below that says "peer" means one of
+-- those, and the MCP bridge addresses them by exactly this name.
+local function peerRole()
+	if not RunService:IsRunMode() then
+		return "edit"
+	end
+	if RunService:IsServer() then
+		return "server"
+	end
+	return "client"
+end
 local toolbar = plugin:CreateToolbar("MCP Integration")
 local button = toolbar:CreateButton("MCP Server", "Connect to MCP Server for AI Integration", "rbxassetid://10734944444")
 -- Remembered across Studio restarts. Without this the plugin came up DISCONNECTED every
@@ -69,6 +90,49 @@ task.defer(function()
 	end
 	-- ▲ ReadonlyArray.forEach ▲
 end)
+--[[
+	
+		PLAY PEERS REGISTER THEMSELVES.
+	
+		Connecting is a click in the plugin's own window, and that window does not exist in a
+		play DataModel -- so the server and client peers used to load, run, and never register
+		with the bridge at all. Every tool that has to reach a live VM (eval_server_runtime,
+		eval_client_runtime, the profilers, get_runtime_logs from a peer) was therefore asking
+		for a peer that was never going to answer.
+	
+		They inherit the edit peer's port rather than being configured: the whole point is that
+		starting a playtest needs no setup. Falling back to the base port covers the first run,
+		before anything has been remembered.
+	
+		Deferred past UI.init for the same reason the block above is -- activatePlugin reads the
+		URL field, which settles a frame later -- and given a longer beat here because a play DM
+		is mid-boot and busy.
+	
+]]
+task.delay(2, function()
+	local role = peerRole()
+	if role == "edit" then
+		-- Older builds left their bridge scripts in the edit DataModel, where they get
+		-- saved into the place. Current ones live only in play forks and die with them.
+		cleanupLegacyEditBridges()
+		return nil
+	end
+	local installed = ensureRuntimeBridgeInstalled()
+	if not installed.installed then
+		warn(`[robloxstudio-mcp] runtime eval bridge install failed: {installed.error}`)
+	end
+	local conn = State.getActiveConnection()
+	if conn.isActive then
+		return nil
+	end
+	local saved = plugin:GetSetting(AUTOCONNECT_KEY)
+	local ports = if type(saved) == "table" then saved else {}
+	local port = if #ports > 0 then ports[1] else State.BASE_PORT
+	conn.port = port
+	conn.serverUrl = `http://localhost:{port}`
+	elements.urlInput.Text = conn.serverUrl
+	Communication.activatePlugin(State.getActiveTabIndex())
+end)
 button.Click:Connect(function()
 	elements.screenGui.Enabled = not elements.screenGui.Enabled
 end)
@@ -104,6 +168,8 @@ local BuildHandlers = TS.import(script, script.Parent, "handlers", "BuildHandler
 local AssetHandlers = TS.import(script, script.Parent, "handlers", "AssetHandlers")
 local CaptureHandlers = TS.import(script, script.Parent, "handlers", "CaptureHandlers")
 local InputHandlers = TS.import(script, script.Parent, "handlers", "InputHandlers")
+local EvalRuntimeHandlers = TS.import(script, script.Parent, "handlers", "EvalRuntimeHandlers")
+local LogHandlers = TS.import(script, script.Parent, "handlers", "LogHandlers")
 local instanceId = HttpService:GenerateGUID(false)
 local assignedRole
 local function detectRole()
@@ -155,6 +221,8 @@ local routeMap = {
 	["/api/get-tagged"] = MetadataHandlers.getTagged,
 	["/api/get-selection"] = MetadataHandlers.getSelection,
 	["/api/execute-luau"] = MetadataHandlers.executeLuau,
+	["/api/eval-runtime"] = EvalRuntimeHandlers.evalRuntime,
+	["/api/get-runtime-logs"] = LogHandlers.getRuntimeLogs,
 	["/api/undo"] = MetadataHandlers.undo,
 	["/api/redo"] = MetadataHandlers.redo,
 	["/api/bulk-set-attributes"] = MetadataHandlers.bulkSetAttributes,
@@ -523,11 +591,286 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Folder" referent="3">
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">EvalBridges</string>
+          <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.include.RuntimeLib)
+-- Game-VM eval bridges, ported from chrrxs/roblox-mcp-primitives.
+--
+-- Our standard `execute_luau target=server/client-N` runs in the plugin VM
+-- with a fresh ModuleScript per call. That gives a clean sandbox but means
+-- `require(SomeModule)` returns a fresh copy, not the one the running game
+-- scripts hold. So runtime-mutated module state is invisible to probes.
+--
+-- These bridges fix that by living inside the user's game scripts. Both
+-- peers use the same symmetric shape:
+--   - Server: a Script in ServerScriptService that creates a BindableFunction.
+--     Plugin (server peer) invokes it with a fresh ModuleScript payload;
+--     require() runs inside the Script VM so it shares the running server's
+--     require cache.
+--   - Client: a LocalScript in StarterPlayer.StarterPlayerScripts that
+--     creates a BindableFunction. Plugin invokes it with a fresh ModuleScript
+--     payload; require() runs inside the LocalScript VM so it shares the
+--     game's require cache.
+--
+-- Why ModuleScript+require on both sides (no loadstring): require'd modules
+-- run with the security level they were created at and don't need
+-- ServerScriptService.LoadStringEnabled, so eval_server_runtime works even
+-- when LoadStringEnabled=false (the default in fresh places).
+--
+-- Lifecycle: bridge scripts are created only in running play DataModels.
+-- The server plugin peer creates the Script in runtime ServerScriptService;
+-- each client plugin peer creates its LocalScript in that client's
+-- PlayerScripts. Nothing is installed into the edit DataModel anymore.
+-- Runtime-created scripts disappear naturally when the playtest stops.
+local _services = TS.import(script, script.Parent.Parent, "node_modules", "@rbxts", "services")
+local Players = _services.Players
+local ReplicatedStorage = _services.ReplicatedStorage
+local RunService = _services.RunService
+local ServerScriptService = _services.ServerScriptService
+local StarterPlayer = _services.StarterPlayer
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local function getStarterPlayerScripts()
+	return StarterPlayer:FindFirstChild("StarterPlayerScripts")
+end
+local SERVER_SCRIPT_NAME = "__MCP_ServerEvalBridge"
+local CLIENT_SCRIPT_NAME = "__MCP_ClientEvalBridge"
+-- Public so the eval_*_runtime tool wrappers can reference the same names.
+local BRIDGE_NAMES = {
+	serverScript = SERVER_SCRIPT_NAME,
+	clientScript = CLIENT_SCRIPT_NAME,
+	serverLocal = "__MCP_ServerEvalLocal",
+	clientLocal = "__MCP_ClientEvalBridge",
+}
+-- Embedded Luau. The double `${...}` references our exported names so a
+-- rename here propagates to both the script source and the tool wrappers.
+local SERVER_BRIDGE_SOURCE = `\
+-- Installed by @chrrxs/robloxstudio-mcp to power the eval_server_runtime MCP\
+-- tool (shared-require-cache eval on the server during playtests). Inert\
+-- outside Studio (no-ops in live games); safe to leave in place.\
+\
+local ServerScriptService = game:GetService("ServerScriptService")\
+local RunService = game:GetService("RunService")\
+\
+if not RunService:IsStudio() then\
+	return\
+end\
+\
+local prevBf = ServerScriptService:FindFirstChild("{BRIDGE_NAMES.serverLocal}")\
+if prevBf then prevBf:Destroy() end\
+\
+local bf = Instance.new("BindableFunction")\
+bf.Name = "{BRIDGE_NAMES.serverLocal}"\
+bf.Archivable = false\
+bf.Parent = ServerScriptService\
+bf.OnInvoke = function(payload)\
+	if typeof(payload) ~= "Instance" or not payload:IsA("ModuleScript") then\
+		return \{ ok = false, value = "payload must be a ModuleScript instance" \}\
+	end\
+	local ok, value = pcall(require, payload)\
+	return \{ ok = ok, value = value \}\
+end\
+`
+local CLIENT_BRIDGE_SOURCE = `\
+-- Installed by @chrrxs/robloxstudio-mcp to power the eval_client_runtime MCP\
+-- tool (shared-require-cache eval on the client during playtests). Inert\
+-- outside Studio (no-ops in live games); safe to leave in place.\
+\
+local ReplicatedStorage = game:GetService("ReplicatedStorage")\
+local RunService = game:GetService("RunService")\
+\
+if not RunService:IsStudio() then\
+	return\
+end\
+\
+local prevBf = ReplicatedStorage:FindFirstChild("{BRIDGE_NAMES.clientLocal}")\
+if prevBf then prevBf:Destroy() end\
+\
+local bf = Instance.new("BindableFunction")\
+bf.Name = "{BRIDGE_NAMES.clientLocal}"\
+bf.Archivable = false\
+bf.Parent = ReplicatedStorage\
+bf.OnInvoke = function(payload)\
+	if typeof(payload) ~= "Instance" or not payload:IsA("ModuleScript") then\
+		return \{ ok = false, value = "payload must be a ModuleScript instance" \}\
+	end\
+	local ok, value = pcall(require, payload)\
+	return \{ ok = ok, value = value \}\
+end\
+`
+-- Stamp written onto each installed bridge Script so we can tell whether the
+-- runtime bridge currently in the play DM was produced by THIS plugin build.
+-- It's a djb2 hash of the actual bridge source plus the plugin version, so ANY
+-- change to the source (or a version bump) yields a new stamp and triggers a
+-- runtime refresh instead of keeping a stale bridge.
+local STAMP_ATTR = "__MCPBridgeStamp"
+local function computeBridgeStamp()
+	local combined = `{SERVER_BRIDGE_SOURCE}|{CLIENT_BRIDGE_SOURCE}`
+	local h = 5381
+	for i = 1, #combined do
+		h = (h * 33 + (string.byte(combined, i))) % 2147483647
+	end
+	-- "3.1.0" is replaced with the package version at package time
+	-- (scripts/build-plugin.mjs injectVersion), so a release bump also restamps.
+	return `{tostring(h)}-3.1.0`
+end
+local BRIDGE_STAMP = computeBridgeStamp()
+local function setSource(scriptInst, source)
+	-- ScriptEditorService is the cleaner API and integrates with Studio's
+	-- edit history; fall back to direct Source mutation (allowed in plugin
+	-- context with PluginSecurity) if the edit service rejects the call.
+	local seOk = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(scriptInst, function()
+			return source
+		end)
+	end)
+	if not seOk then
+		scriptInst.Source = source
+	end
+end
+local function findLegacyEditBridges()
+	local sps = getStarterPlayerScripts()
+	return {
+		server = ServerScriptService:FindFirstChild(SERVER_SCRIPT_NAME),
+		client = if sps then sps:FindFirstChild(CLIENT_SCRIPT_NAME) else nil,
+	}
+end
+local function destroyIfPresent(parent, name)
+	local existing = parent:FindFirstChild(name)
+	if existing then
+		pcall(function()
+			return existing:Destroy()
+		end)
+	end
+end
+local function cleanupLegacyEditBridges()
+	if RunService:IsRunning() then
+		return nil
+	end
+	local _binding = findLegacyEditBridges()
+	local server = _binding.server
+	local client = _binding.client
+	if server then
+		pcall(function()
+			return server:Destroy()
+		end)
+	end
+	if client then
+		pcall(function()
+			return client:Destroy()
+		end)
+	end
+end
+local function serverRuntimeBridgeReady()
+	local scriptInst = ServerScriptService:FindFirstChild(SERVER_SCRIPT_NAME)
+	local bindable = ServerScriptService:FindFirstChild(BRIDGE_NAMES.serverLocal)
+	return scriptInst ~= nil and scriptInst:GetAttribute(STAMP_ATTR) == BRIDGE_STAMP and bindable ~= nil and bindable:IsA("BindableFunction")
+end
+local function getPlayerScripts()
+	local localPlayer = Players.LocalPlayer
+	if not localPlayer then
+		return nil
+	end
+	local playerScripts = localPlayer:FindFirstChild("PlayerScripts")
+	if not playerScripts then
+		playerScripts = localPlayer:WaitForChild("PlayerScripts", 5)
+	end
+	return playerScripts
+end
+local function clientRuntimeBridgeReady()
+	local playerScripts = getPlayerScripts()
+	if not playerScripts then
+		return false
+	end
+	local scriptInst = playerScripts:FindFirstChild(CLIENT_SCRIPT_NAME)
+	local bindable = ReplicatedStorage:FindFirstChild(BRIDGE_NAMES.clientLocal)
+	return scriptInst ~= nil and scriptInst:GetAttribute(STAMP_ATTR) == BRIDGE_STAMP and bindable ~= nil and bindable:IsA("BindableFunction")
+end
+local function installServerRuntimeBridge()
+	if serverRuntimeBridgeReady() then
+		return {
+			installed = true,
+		}
+	end
+	local ok, err = pcall(function()
+		destroyIfPresent(ServerScriptService, SERVER_SCRIPT_NAME)
+		destroyIfPresent(ServerScriptService, BRIDGE_NAMES.serverLocal)
+		local serverScript = Instance.new("Script")
+		serverScript.Name = SERVER_SCRIPT_NAME
+		serverScript.Archivable = false
+		setSource(serverScript, SERVER_BRIDGE_SOURCE)
+		serverScript:SetAttribute(STAMP_ATTR, BRIDGE_STAMP)
+		serverScript.Parent = ServerScriptService
+	end)
+	if not ok then
+		return {
+			installed = false,
+			error = tostring(err),
+		}
+	end
+	return {
+		installed = true,
+	}
+end
+local function installClientRuntimeBridge()
+	if clientRuntimeBridgeReady() then
+		return {
+			installed = true,
+		}
+	end
+	local playerScripts = getPlayerScripts()
+	if not playerScripts then
+		return {
+			installed = false,
+			error = "Players.LocalPlayer.PlayerScripts not found - cannot install client eval bridge",
+		}
+	end
+	local ok, err = pcall(function()
+		destroyIfPresent(playerScripts, CLIENT_SCRIPT_NAME)
+		destroyIfPresent(ReplicatedStorage, BRIDGE_NAMES.clientLocal)
+		local clientScript = Instance.new("LocalScript")
+		clientScript.Name = CLIENT_SCRIPT_NAME
+		clientScript.Archivable = false
+		setSource(clientScript, CLIENT_BRIDGE_SOURCE)
+		clientScript:SetAttribute(STAMP_ATTR, BRIDGE_STAMP)
+		clientScript.Parent = playerScripts
+	end)
+	if not ok then
+		return {
+			installed = false,
+			error = tostring(err),
+		}
+	end
+	return {
+		installed = true,
+	}
+end
+local function ensureRuntimeBridgeInstalled()
+	if not RunService:IsRunning() then
+		return {
+			installed = false,
+			error = "Eval bridges are installed only in running play DataModels",
+		}
+	end
+	if RunService:IsServer() then
+		return installServerRuntimeBridge()
+	end
+	return installClientRuntimeBridge()
+end
+return {
+	cleanupLegacyEditBridges = cleanupLegacyEditBridges,
+	ensureRuntimeBridgeInstalled = ensureRuntimeBridgeInstalled,
+	BRIDGE_NAMES = BRIDGE_NAMES,
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="4">
         <Properties>
           <string name="Name">handlers</string>
         </Properties>
-        <Item class="ModuleScript" referent="4">
+        <Item class="ModuleScript" referent="5">
           <Properties>
             <string name="Name">AssetHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -813,7 +1156,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="5">
+        <Item class="ModuleScript" referent="6">
           <Properties>
             <string name="Name">BuildHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -1378,7 +1721,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="6">
+        <Item class="ModuleScript" referent="7">
           <Properties>
             <string name="Name">CaptureHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -1544,7 +1887,161 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="7">
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">EvalRuntimeHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local _services = TS.import(script, script.Parent.Parent.Parent, "node_modules", "@rbxts", "services")
+local LogService = _services.LogService
+local ReplicatedStorage = _services.ReplicatedStorage
+local RunService = _services.RunService
+local ServerScriptService = _services.ServerScriptService
+local _EvalBridges = TS.import(script, script.Parent.Parent, "EvalBridges")
+local BRIDGE_NAMES = _EvalBridges.BRIDGE_NAMES
+local ensureRuntimeBridgeInstalled = _EvalBridges.ensureRuntimeBridgeInstalled
+local LuauExec = TS.import(script, script.Parent.Parent, "LuauExec")
+local PAYLOAD_INSTANCE_NAME = "__MCPEvalPayload"
+local function findBridge(config)
+	local bridge = config.service:FindFirstChild(config.bridgeName)
+	return if bridge and bridge:IsA("BindableFunction") then bridge else nil
+end
+local function waitForBridge(config, timeoutSec)
+	if timeoutSec == nil then
+		timeoutSec = 2
+	end
+	local deadline = tick() + timeoutSec
+	local bridge = findBridge(config)
+	while not bridge and tick() < deadline do
+		task.wait(0.05)
+		bridge = findBridge(config)
+	end
+	return bridge
+end
+local function getBridgeConfig()
+	if not RunService:IsRunning() then
+		return {
+			error = "eval_*_runtime requires a running playtest.",
+		}
+	end
+	if RunService:IsServer() then
+		return {
+			service = ServerScriptService,
+			bridgeName = BRIDGE_NAMES.serverLocal,
+			missingError = "ServerEvalBridge not found. The bridge runs inside the play DM, so a playtest must be running. The bridge installs automatically in the runtime server peer, including for manually-started playtests.",
+		}
+	end
+	return {
+		service = ReplicatedStorage,
+		bridgeName = BRIDGE_NAMES.clientLocal,
+		missingError = "ClientEvalBridge not found. The bridge runs inside the play DM, so a playtest must be running. The bridge installs automatically in the runtime client peer, including for manually-started playtests.",
+	}
+end
+local function evalRuntime(requestData)
+	local code = requestData.code
+	if not (code ~= "" and code) or code == "" then
+		return {
+			error = "Code is required",
+		}
+	end
+	local config = getBridgeConfig()
+	if config.error ~= nil then
+		return {
+			bridge = "missing",
+			error = config.error,
+		}
+	end
+	local bridge = findBridge(config)
+	if not bridge then
+		local install = ensureRuntimeBridgeInstalled()
+		if not install.installed then
+			return {
+				bridge = "missing",
+				error = `{config.missingError} Runtime bridge install failed: {install.error}`,
+			}
+		end
+		bridge = waitForBridge(config)
+	end
+	if not bridge then
+		return {
+			bridge = "missing",
+			error = `{config.missingError} Runtime bridge was installed but did not become ready.`,
+		}
+	end
+	local m = Instance.new("ModuleScript")
+	m.Name = PAYLOAD_INSTANCE_NAME
+	local userLines = LuauExec.countLines(code)
+	local wrapped = LuauExec.buildWrapper(code, PAYLOAD_INSTANCE_NAME)
+	local okSet, setErr = pcall(function()
+		m.Source = wrapped
+	end)
+	if not okSet then
+		m:Destroy()
+		return {
+			bridge = "ok",
+			ok = false,
+			error = `ModuleScript Source set failed: {tostring(setErr)}`,
+		}
+	end
+	m.Parent = game:GetService("Workspace")
+	local historyStart = #LogService:GetLogHistory()
+	local invokeOk, invokeResult = pcall(function()
+		return bridge:Invoke(m)
+	end)
+	m:Destroy()
+	if not invokeOk then
+		return {
+			bridge = "ok",
+			ok = false,
+			error = tostring(invokeResult),
+		}
+	end
+	if not (type(invokeResult) == "table") then
+		return {
+			bridge = "ok",
+			ok = false,
+			error = `Eval bridge returned invalid result: {tostring(invokeResult)}`,
+		}
+	end
+	local bridgeResult = invokeResult
+	if bridgeResult.ok ~= true then
+		return {
+			bridge = "ok",
+			ok = false,
+			error = LuauExec.recoverPayloadRequireError(bridgeResult.value, userLines, PAYLOAD_INSTANCE_NAME, historyStart),
+		}
+	end
+	local inner = bridgeResult.value
+	if not (type(inner) == "table") then
+		return {
+			bridge = "ok",
+			ok = true,
+			result = if inner == nil then nil else LuauExec.formatReturnValue(inner),
+		}
+	end
+	local r = inner
+	local ok = r.ok == true
+	local _object = {
+		bridge = "ok",
+		ok = ok,
+		result = if ok and r.value ~= nil then LuauExec.formatReturnValue(r.value) else nil,
+		error = if not ok then tostring(r.value) else nil,
+	}
+	local _left = "output"
+	local _condition = r.output
+	if _condition == nil then
+		_condition = {}
+	end
+	_object[_left] = _condition
+	return _object
+end
+return {
+	evalRuntime = evalRuntime,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="9">
           <Properties>
             <string name="Name">InputHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -1698,7 +2195,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="8">
+        <Item class="ModuleScript" referent="10">
           <Properties>
             <string name="Name">InstanceHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2205,7 +2702,33 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="9">
+        <Item class="ModuleScript" referent="11">
+          <Properties>
+            <string name="Name">LogHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local RuntimeLogBuffer = TS.import(script, script.Parent.Parent, "RuntimeLogBuffer")
+local function getRuntimeLogs(requestData)
+	local since = requestData.since
+	local tail = requestData.tail
+	local filter = requestData.filter
+	-- This is the buffer that captured the LogService event, not necessarily
+	-- the script-origin peer. Ordinary playtests share/reflect logs across
+	-- edit/server/client LogService buffers.
+	local capturedBy = RuntimeLogBuffer.detectPeer()
+	return RuntimeLogBuffer.query({
+		since = since,
+		tail = tail,
+		filter = filter,
+	}, capturedBy)
+end
+return {
+	getRuntimeLogs = getRuntimeLogs,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">MetadataHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2788,7 +3311,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">PropertyHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3040,7 +3563,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">QueryHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -4056,7 +4579,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="15">
           <Properties>
             <string name="Name">ScriptHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -4752,7 +5275,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">TestHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5067,7 +5590,441 @@ return {
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="17">
+        <Properties>
+          <string name="Name">LuauExec</string>
+          <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+-- eslint-disable 
+-- Shared execute_luau machinery for edit/server (MetadataHandlers.executeLuau)
+-- and the play-client peer (ClientBroker.handleExecuteLuau). Three things this
+-- module owns:
+--
+--   1. The IIFE wrapper that captures print/warn, wraps require() so nested
+--      ModuleScript load failures can recover the real LogService diagnostic,
+--      runs user code in xpcall, and always returns { ok, value, output } so
+--      the ModuleScript itself always returns exactly one value (otherwise
+--      `print("hi")` with no return would fail with "Module code did not
+--      return exactly one value").
+--
+--   2. The loadstring-then-ModuleScript-require fallback, with the parse-error
+--      recovery hack that pulls the real diagnostic from LogService.
+--
+--   3. Return-value formatting: tables get HttpService:JSONEncode'd so the
+--      caller sees `{"x":1,"y":2}` instead of `table: 0xaddr`; primitives
+--      pass through tostring. The encode is pcall'd so cycles or
+--      non-serializable values gracefully fall back to tostring.
+--
+-- Before this module existed, the client peer used a stripped-down
+-- require-only execution path that lacked both the wrapper and the JSON
+-- formatting, producing two well-known papercuts:
+--   - `print("hi")` (no return) failed with "Module code did not return..."
+--   - Returning a table yielded `table: 0xaddr` instead of structured data.
+local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
+local PAYLOAD_INSTANCE_NAME = "__MCPExecLuauPayload"
+local REQUIRE_GENERIC_ERROR = "Requested module experienced an error while loading"
+-- Number of lines the wrapper emits BEFORE the first line of user code.
+-- Used both inside the wrapper (Luau __mcp_LINE_OFFSET) and on the TS side
+-- (remapPayloadLines, for compile errors recovered from LogService) so user
+-- code errors report user-relative line numbers instead of the inflated
+-- "line 49" the wrapper would otherwise expose. If you reorder buildWrapper's
+-- prefix lines, update this constant.
+local WRAPPER_LINE_OFFSET = 84
+-- Count source lines so the wrapper can filter traceback frames that fall
+-- outside the user code range (the wrapper's own preamble/postamble lines).
+local function countLines(s)
+	local n = 1
+	local size = #s
+	do
+		local i = 1
+		local _shouldIncrement = false
+		while true do
+			if _shouldIncrement then
+				i += 1
+			else
+				_shouldIncrement = true
+			end
+			if not (i <= size) then
+				break
+			end
+			if string.sub(s, i, i) == "\n" then
+				n += 1
+			end
+		end
+	end
+	return n
+end
+local function luaPatternEscape(s)
+	local escaped = string.gsub(s, "([^%w])", "%%%1")
+	return escaped
+end
+local function buildWrapper(code, payloadInstanceName)
+	if payloadInstanceName == nil then
+		payloadInstanceName = PAYLOAD_INSTANCE_NAME
+	end
+	-- If you reorder the prefix lines below, update WRAPPER_LINE_OFFSET to
+	-- match the number of lines emitted BEFORE the ${code} substitution.
+	-- The constant is mirrored inside the wrapper (__mcp_LINE_OFFSET) and
+	-- used by remapPayloadLines on the TS side.
+	local userLines = countLines(code)
+	local payloadPattern = luaPatternEscape(payloadInstanceName)
+	return `return ((function()\
+\tlocal __mcp_traceback\
+\tlocal __mcp_remap\
+\tlocal __mcp_LINE_OFFSET = {WRAPPER_LINE_OFFSET}\
+\tlocal __mcp_USER_LINES = {userLines}\
+\tlocal __mcp_LogService = game:GetService("LogService")\
+\tlocal __mcp_REQUIRE_GENERIC = "{REQUIRE_GENERIC_ERROR}"\
+\tlocal __mcp_output = \{\}\
+\tlocal __mcp_real_print = print\
+\tlocal __mcp_real_warn = warn\
+\tlocal __mcp_real_require = require\
+\tlocal print = function(...)\
+\t\t__mcp_real_print(...)\
+\t\tlocal args = \{...\}\
+\t\tlocal parts = table.create(#args)\
+\t\tfor i, a in ipairs(args) do parts[i] = tostring(a) end\
+\t\ttable.insert(__mcp_output, table.concat(parts, "\\t"))\
+\tend\
+\tlocal warn = function(...)\
+\t\t__mcp_real_warn(...)\
+\t\tlocal args = \{...\}\
+\t\tlocal parts = table.create(#args)\
+\t\tfor i, a in ipairs(args) do parts[i] = tostring(a) end\
+\t\ttable.insert(__mcp_output, "[warn] " .. table.concat(parts, "\\t"))\
+\tend\
+\tlocal function __mcp_is_stack_noise(msg)\
+\t\treturn msg == "Stack Begin" or msg == "Stack End" or string.sub(msg, 1, 8) == "Script '"\
+\tend\
+\tlocal function __mcp_is_actionable_require_log(entry)\
+\t\tif not entry or entry.messageType ~= Enum.MessageType.MessageError then return false end\
+\t\tlocal msg = tostring(entry.message)\
+\t\treturn msg ~= __mcp_REQUIRE_GENERIC and not __mcp_is_stack_noise(msg)\
+\tend\
+\tlocal function __mcp_entry_mentions_module(entry, module_path)\
+\t\tif not entry or not module_path or module_path == "" then return false end\
+\t\treturn string.find(tostring(entry.message), module_path, 1, true) ~= nil\
+\tend\
+\tlocal function __mcp_prior_module_error(hist, module_path)\
+\t\tif not module_path or module_path == "" then return nil end\
+\t\tfor i = #hist, 1, -1 do\
+\t\t\tlocal entry = hist[i]\
+\t\t\tif __mcp_entry_mentions_module(entry, module_path) then\
+\t\t\t\tif __mcp_is_actionable_require_log(entry) then\
+\t\t\t\t\treturn tostring(entry.message)\
+\t\t\t\tend\
+\t\t\t\tfor j = i - 1, math.max(1, i - 6), -1 do\
+\t\t\t\t\tlocal previous = hist[j]\
+\t\t\t\t\tif __mcp_is_actionable_require_log(previous) then\
+\t\t\t\t\t\treturn tostring(previous.message)\
+\t\t\t\t\tend\
+\t\t\t\tend\
+\t\t\tend\
+\t\tend\
+\t\treturn nil\
+\tend\
+\tlocal function __mcp_recover_require_error(err, history_start, module)\
+\t\tlocal err_msg = tostring(err)\
+\t\tif err_msg ~= __mcp_REQUIRE_GENERIC then return err_msg end\
+\t\tlocal module_path\
+\t\tif typeof(module) == "Instance" then\
+\t\t\tlocal ok_path, path = pcall(function()\
+\t\t\t\treturn module:GetFullName()\
+\t\t\tend)\
+\t\t\tif ok_path then module_path = path end\
+\t\tend\
+\t\ttask.wait(0.05)\
+\t\tlocal hist = __mcp_LogService:GetLogHistory()\
+\t\tfor i = #hist, history_start + 1, -1 do\
+\t\t\tlocal entry = hist[i]\
+\t\t\tif __mcp_is_actionable_require_log(entry) then\
+\t\t\t\treturn tostring(entry.message)\
+\t\t\tend\
+\t\tend\
+\t\tlocal prior = __mcp_prior_module_error(hist, module_path)\
+\t\tif prior then return prior end\
+\t\treturn err_msg\
+\tend\
+\tlocal function require(module)\
+\t\tlocal history_start = #__mcp_LogService:GetLogHistory()\
+\t\tlocal ok, value = pcall(__mcp_real_require, module)\
+\t\tif ok then return value end\
+\t\terror(__mcp_recover_require_error(value, history_start, module), 0)\
+\tend\
+\tlocal function __mcp_run()\
+{code}\
+\tend\
+\t__mcp_remap = function(s)\
+\t\t-- Two chunk-name formats can reference our payload:\
+\t\t--   * "Workspace.__MCPExecLuauPayload:N" — ModuleScript:require fallback path\
+\t\t--   * "[string \\"return ((function()...\\"]:N" — loadstring() (default in plugin)\
+\t\t-- Subtract LINE_OFFSET to get the user-relative number, then clamp.\
+\t\t-- Clamping matters for unclosed constructs ("local x = (") where the\
+\t\t-- parser keeps reading into wrapper postamble and reports a payload\
+\t\t-- line past user EOF. Without clamping, that frames wrapper postamble\
+\t\t-- as user code.\
+\t\tlocal function __mcp_user_line(payload_n)\
+\t\t\tlocal user_n = payload_n - __mcp_LINE_OFFSET\
+\t\t\tif user_n < 1 then return "1" end\
+\t\t\tif user_n > __mcp_USER_LINES then return tostring(__mcp_USER_LINES) .. " (at end of input)" end\
+\t\t\treturn tostring(user_n)\
+\t\tend\
+\t\ts = string.gsub(s, "Workspace%.{payloadPattern}:(%d+)", function(num)\
+\t\t\tlocal n = tonumber(num)\
+\t\t\tif n then return "user_code:" .. __mcp_user_line(n) end\
+\t\t\treturn "user_code:" .. num\
+\t\tend)\
+\t\ts = string.gsub(s, "{payloadPattern}:(%d+)", function(num)\
+\t\t\tlocal n = tonumber(num)\
+\t\t\tif n then return "user_code:" .. __mcp_user_line(n) end\
+\t\t\treturn "user_code:" .. num\
+\t\tend)\
+\t\ts = string.gsub(s, '%[string "[^"]+"%]:(%d+)', function(num)\
+\t\t\tlocal n = tonumber(num)\
+\t\t\tif n then return "user_code:" .. __mcp_user_line(n) end\
+\t\t\treturn "user_code:" .. num\
+\t\tend)\
+\t\treturn s\
+\tend\
+\t__mcp_traceback = function(err)\
+\t\tlocal raw = debug.traceback(tostring(err), 2)\
+\t\tlocal kept = \{\}\
+\t\tfor line in string.gmatch(raw, "[^\\n]+") do\
+\t\t\t-- Extract referenced line number (either chunk-name format).\
+\t\t\tlocal num_str = string.match(line, "__MCPExecLuauPayload:(%d+)")\
+\t\t\t\tor string.match(line, '%[string "[^"]+"%]:(%d+)')\
+\t\t\tlocal n = num_str and tonumber(num_str)\
+\t\t\t-- Strip the "in function '__mcp_run'" annotation before doing\
+\t\t\t-- any filtering, because user-code frames carry that suffix —\
+\t\t\t-- the entire user payload is hosted inside __mcp_run, so EVERY\
+\t\t\t-- user frame would otherwise match a naive "__mcp_" filter and\
+\t\t\t-- get dropped. Strip first, then apply filters.\
+\t\t\tline = (string.gsub(line, " in function '__mcp_run'", ""))\
+\t\t\tlocal skip = string.find(line, "MCPPlugin", 1, true)\
+\t\t\t\tor string.find(line, "__mcp_", 1, true)\
+\t\t\t\tor string.find(line, "in function 'xpcall'", 1, true)\
+\t\t\t-- Frame lines pointing at wrapper preamble/postamble (outside\
+\t\t\t-- user range) are wrapper internals — drop them. Lines without\
+\t\t\t-- a payload-chunk line number (the traceback header / engine\
+\t\t\t-- C frames) are kept; remap is a no-op for them.\
+\t\t\tif n and (n <= __mcp_LINE_OFFSET or n > __mcp_LINE_OFFSET + __mcp_USER_LINES) then\
+\t\t\t\tskip = true\
+\t\t\tend\
+\t\t\tif not skip then\
+\t\t\t\ttable.insert(kept, __mcp_remap(line))\
+\t\t\tend\
+\t\tend\
+\t\treturn table.concat(kept, "\\n")\
+\tend\
+\tlocal ok, errOrValue = xpcall(__mcp_run, __mcp_traceback)\
+\treturn \{ ok = ok, value = errOrValue, output = __mcp_output \}\
+end)())`
+end
+-- TS-side mirror of the Lua __mcp_remap. Used by runViaModuleScript when
+-- pulling the real compile-error diagnostic out of LogService — that error
+-- references the payload module's line number directly, and never passes
+-- through the IIFE's runtime wrapper.
+local function remapPayloadLines(s, userLines, payloadInstanceName)
+	if payloadInstanceName == nil then
+		payloadInstanceName = PAYLOAD_INSTANCE_NAME
+	end
+	-- Mirror of the Lua __mcp_remap inside the wrapper, for paths that
+	-- don't pass through the IIFE (compile errors recovered from
+	-- LogService, the immediate loadstring compileError surface). Same
+	-- two-format coverage plus the same clamp: unclosed user constructs
+	-- let the parser consume wrapper postamble, so the raw payload line
+	-- is sometimes well past user EOF — clamp to [1, userLines] and
+	-- annotate so the error doesn't say "user_code:49" for one-line input.
+	local userLine = function(payload)
+		local u = payload - WRAPPER_LINE_OFFSET
+		if u < 1 then
+			return "1"
+		end
+		if u > userLines then
+			return `{tostring(userLines)} (at end of input)`
+		end
+		return tostring(u)
+	end
+	local payloadPattern = luaPatternEscape(payloadInstanceName)
+	local out = s
+	local a = string.gsub(out, `Workspace%.{payloadPattern}:(%d+)`, function(num)
+		local n = tonumber(num)
+		if n ~= nil then
+			return `user_code:{userLine(n)}`
+		end
+		return `user_code:{num}`
+	end)
+	out = a
+	local b = string.gsub(out, `{payloadPattern}:(%d+)`, function(num)
+		local n = tonumber(num)
+		if n ~= nil then
+			return `user_code:{userLine(n)}`
+		end
+		return `user_code:{num}`
+	end)
+	out = b
+	local c = string.gsub(out, '%[string "[^"]+"%]:(%d+)', function(num)
+		local n = tonumber(num)
+		if n ~= nil then
+			return `user_code:{userLine(n)}`
+		end
+		return `user_code:{num}`
+	end)
+	return c
+end
+local recoverPayloadRequireError
+local function runViaModuleScript(wrapped, userLines)
+	local m = Instance.new("ModuleScript")
+	m.Name = PAYLOAD_INSTANCE_NAME
+	local okSet, setErr = pcall(function()
+		m.Source = wrapped
+	end)
+	if not okSet then
+		m:Destroy()
+		-- error(..., 0) suppresses the "user_MCPPlugin.rbxmx.MCPPlugin.modules.LuauExec:N:"
+		-- prefix that error() would otherwise prepend, keeping the visible
+		-- message focused on the user-actionable error rather than our path.
+		error(`ModuleScript Source set failed: {tostring(setErr)}`, 0)
+	end
+	m.Parent = game:GetService("Workspace")
+	local okReq, reqResult = pcall(function()
+		return require(m)
+	end)
+	m:Destroy()
+	if not okReq then
+		-- Compile errors reference the payload module's line number directly
+		-- — remap + clamp to user-relative line numbers so `local x = 1 +`
+		-- reports :1: instead of :23:, and reports the clamp annotation
+		-- when the parser ran off the end of user code into wrapper code.
+		error(recoverPayloadRequireError(reqResult, userLines, PAYLOAD_INSTANCE_NAME), 0)
+	end
+	return reqResult
+end
+local function isLoadstringUnavailable(err)
+	local errStr = tostring(err)
+	local matchStart = string.find(errStr, "not available", 1, true)
+	return matchStart ~= nil
+end
+-- Returns a string suitable for `returnValue`. Tables get JSON-encoded so
+-- the caller sees structured data instead of "table: 0xaddr". Anything that
+-- JSONEncode chokes on (cycles, Roblox userdata) falls back to tostring.
+local function formatReturnValue(value)
+	if value == nil then
+		return ""
+	end
+	local _value = value
+	if type(_value) == "table" then
+		local ok, encoded = pcall(function()
+			return HttpService:JSONEncode(value)
+		end)
+		if ok then
+			return encoded
+		end
+	end
+	return tostring(value)
+end
+function recoverPayloadRequireError(err, userLines, payloadInstanceName, historyStart)
+	if payloadInstanceName == nil then
+		payloadInstanceName = PAYLOAD_INSTANCE_NAME
+	end
+	if historyStart == nil then
+		historyStart = 0
+	end
+	local errMsg = tostring(err)
+	-- pcall(require, m) collapses parse/compile failures into the canned
+	-- engine string. The real diagnostic is emitted to LogService on the
+	-- next engine frame — give it ~50ms to land then scan backward.
+	if errMsg == REQUIRE_GENERIC_ERROR then
+		task.wait(0.05)
+		local payloadPathPrefix = `Workspace.{payloadInstanceName}:`
+		local hist = LogService:GetLogHistory()
+		local start = math.max(0, historyStart)
+		do
+			local i = #hist - 1
+			local _shouldIncrement = false
+			while true do
+				if _shouldIncrement then
+					i -= 1
+				else
+					_shouldIncrement = true
+				end
+				if not (i >= start) then
+					break
+				end
+				local e = hist[i + 1]
+				if e.messageType == Enum.MessageType.MessageError and string.sub(e.message, 1, #payloadPathPrefix) == payloadPathPrefix then
+					errMsg = e.message
+					break
+				end
+			end
+		end
+	end
+	return remapPayloadLines(errMsg, userLines, payloadInstanceName)
+end
+local function execute(code)
+	if not (code ~= "" and code) or code == "" then
+		return {
+			success = false,
+			error = "code is required",
+		}
+	end
+	local wrapped = buildWrapper(code)
+	local userLines = countLines(code)
+	local success, result = pcall(function()
+		local fn, compileError = loadstring(wrapped)
+		if not fn then
+			if isLoadstringUnavailable(compileError) then
+				return runViaModuleScript(wrapped, userLines)
+			end
+			error(`Compile error: {remapPayloadLines(tostring(compileError), userLines)}`, 0)
+		end
+		return fn()
+	end)
+	-- loadstring can throw (not return nil) when ServerScriptService.
+	-- LoadStringEnabled is false; treat that as a second-chance fallback.
+	if not success and isLoadstringUnavailable(result) then
+		success, result = pcall(function()
+			return runViaModuleScript(wrapped, userLines)
+		end)
+	end
+	if not success then
+		return {
+			success = false,
+			error = tostring(result),
+			output = {},
+			message = "Code execution failed",
+		}
+	end
+	local r = result
+	local capturedOutput = r.output
+	local output = if capturedOutput ~= nil then capturedOutput else ({})
+	if r.ok == true then
+		return {
+			success = true,
+			returnValue = if r.value ~= nil then formatReturnValue(r.value) else nil,
+			output = output,
+			message = "Code executed successfully",
+		}
+	end
+	return {
+		success = false,
+		error = if r.value ~= nil then tostring(r.value) else "(unknown error)",
+		output = output,
+		message = "Code execution failed",
+	}
+end
+return {
+	buildWrapper = buildWrapper,
+	countLines = countLines,
+	execute = execute,
+	formatReturnValue = formatReturnValue,
+	recoverPayloadRequireError = recoverPayloadRequireError,
+	remapPayloadLines = remapPayloadLines,
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">Recording</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5097,7 +6054,262 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="19">
+        <Properties>
+          <string name="Name">RuntimeLogBuffer</string>
+          <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.include.RuntimeLib)
+-- Per-capture in-memory ring buffer for LogService.MessageOut events.
+-- Powers the get_runtime_logs MCP tool. Replaces the out-of-tree LogBuffer
+-- primitives + StringValue approach from chrrxs/roblox-mcp-primitives.
+--
+-- Each peer's plugin attaches a MessageOut listener at plugin load (edit DM,
+-- play-server DM, play-client DM all run their own copy of this module).
+-- Captured entries live in plugin module-state; nothing is parented to the
+-- DataModel. The buffer is bounded by a message-byte budget; oldest entries
+-- drop when over budget.
+--
+-- Capture caveat: returned entries reflect which plugin buffer CAPTURED the
+-- entry, NOT which peer's script originated the print. LogService reflects
+-- prints across peers in ordinary Studio Play (a server print can appear in
+-- server and client LogService:GetLogHistory()). The MCP-side aggregator
+-- exposes that as capturedBy, and only promotes it to origin peer in
+-- StudioTestService multiplayer sessions where peer attribution is reliable.
+local _services = TS.import(script, script.Parent.Parent, "node_modules", "@rbxts", "services")
+local LogService = _services.LogService
+local RunService = _services.RunService
+local MAX_BYTES = 64 * 1024
+local HARD_ENTRY_CAP = 50_000
+local entries = {}
+local totalBytes = 0
+local totalDropped = 0
+local nextSeq = 1
+local installed = false
+local function levelTag(t)
+	if t == Enum.MessageType.MessageWarning then
+		return "WARN"
+	end
+	if t == Enum.MessageType.MessageError then
+		return "ERR"
+	end
+	if t == Enum.MessageType.MessageInfo then
+		return "INFO"
+	end
+	return "OUT"
+end
+local function nowSec()
+	return DateTime.now().UnixTimestampMillis / 1000
+end
+-- Studio occasionally exposes binary-bearing Output messages through
+-- LogService (for example, plugin hydration diagnostics containing raw CSG
+-- data). HttpService:JSONEncode rejects those strings outright. Preserve all
+-- valid UTF-8 verbatim and make only malformed bytes JSON-safe and visible.
+local function escapeInvalidUtf8(msg)
+	local valid = utf8.len(msg)
+	-- Roblox currently returns nil (not the false declared by @rbxts/types)
+	-- when it encounters a malformed sequence. A numeric result is the only
+	-- portable success discriminator across both representations.
+	if type(valid) == "number" then
+		return msg
+	end
+	local parts = {}
+	local cursor = 1
+	while cursor <= #msg do
+		local suffixValid, invalidPosition = utf8.len(msg, cursor)
+		if type(suffixValid) == "number" then
+			local _arg0 = string.sub(msg, cursor)
+			table.insert(parts, _arg0)
+			break
+		end
+		if not (type(invalidPosition) == "number") then
+			break
+		end
+		if invalidPosition > cursor then
+			local _arg0 = string.sub(msg, cursor, invalidPosition - 1)
+			table.insert(parts, _arg0)
+		end
+		local invalidByte = string.byte(msg, invalidPosition)
+		local _arg0 = string.format("\\x%02X", invalidByte)
+		table.insert(parts, _arg0)
+		cursor = invalidPosition + 1
+	end
+	return table.concat(parts, "")
+end
+local function dropOldestUntilFits(incomingBytes)
+	while #entries > 0 and (totalBytes + incomingBytes > MAX_BYTES or #entries >= HARD_ENTRY_CAP) do
+		local dropped = table.remove(entries, 1)
+		totalBytes -= #dropped.message
+		totalDropped += 1
+	end
+end
+local function pushEntry(msg, t, ts, data)
+	if ts == nil then
+		ts = nowSec()
+	end
+	local safeMessage = escapeInvalidUtf8(msg)
+	local bytes = #safeMessage
+	dropOldestUntilFits(bytes)
+	local _arg0 = {
+		seq = nextSeq,
+		ts = ts,
+		level = levelTag(t),
+		message = safeMessage,
+		data = data,
+	}
+	table.insert(entries, _arg0)
+	nextSeq += 1
+	totalBytes += bytes
+end
+local function seedRuntimeHistory()
+	local ok, history = pcall(function()
+		return LogService:GetLogHistory()
+	end)
+	if not ok then
+		return nil
+	end
+	local isEdit = not RunService:IsRunning()
+	-- GetLogHistory timestamps and DateTime.now() share Unix time, while
+	-- os.clock() is elapsed time for this Studio process. Their difference is
+	-- therefore the process launch boundary. Edit-mode history is filtered to
+	-- that boundary so startup errors from this launch are recovered without
+	-- importing history left by an earlier Studio process.
+	local processStartedAt = nowSec() - os.clock()
+	for _, entry in history do
+		local _message = entry.message
+		if not (type(_message) == "string") then
+			continue
+		end
+		local _timestamp = entry.timestamp
+		local timestamp = if type(_timestamp) == "number" then entry.timestamp else nil
+		if isEdit and (timestamp == nil or timestamp < processStartedAt - 1) then
+			continue
+		end
+		pushEntry(entry.message, entry.messageType, timestamp)
+	end
+end
+local function install()
+	if installed then
+		return nil
+	end
+	if not RunService:IsStudio() then
+		return nil
+	end
+	installed = true
+	-- Every peer can emit startup logs before the plugin finishes loading.
+	-- Seed from per-DataModel LogHistory so get_runtime_logs can still see them;
+	-- edit history is bounded to the current Studio process above.
+	seedRuntimeHistory()
+	LogService.MessageOut:Connect(function(msg, t, context)
+		pushEntry(msg, t, nil, context)
+	end)
+end
+local function detectPeer()
+	if not RunService:IsRunning() then
+		return "edit"
+	end
+	if RunService:IsServer() then
+		return "server"
+	end
+	return "client"
+end
+local function query(opts, capturedBy)
+	local _result
+	if opts.since ~= nil then
+		-- ▼ ReadonlyArray.filter ▼
+		local _newValue = {}
+		local _callback = function(e)
+			return e.seq > (opts.since)
+		end
+		local _length = 0
+		for _k, _v in entries do
+			if _callback(_v, _k - 1, entries) == true then
+				_length += 1
+				_newValue[_length] = _v
+			end
+		end
+		-- ▲ ReadonlyArray.filter ▲
+		_result = _newValue
+	else
+		local _array = {}
+		local _length = #_array
+		table.move(entries, 1, #entries, _length + 1, _array)
+		_result = _array
+	end
+	local result = _result
+	if opts.filter ~= nil then
+		-- Plain substring search (4th arg = true). Pattern matching here was
+		-- surprising in practice - Lua magic chars in messages would silently
+		-- not match (e.g. filter="MARK-EDIT" against "MARK-EDIT-001" fails
+		-- because '-' means "0+" in Lua patterns). Substring search matches
+		-- most users' mental model of "filter messages containing this text".
+		local needle = opts.filter
+		-- ▼ ReadonlyArray.filter ▼
+		local _newValue = {}
+		local _callback = function(e)
+			local start = string.find(e.message, needle, 1, true)
+			return start ~= nil
+		end
+		local _length = 0
+		for _k, _v in result do
+			if _callback(_v, _k - 1, result) == true then
+				_length += 1
+				_newValue[_length] = _v
+			end
+		end
+		-- ▲ ReadonlyArray.filter ▲
+		result = _newValue
+	end
+	if opts.tail ~= nil and #result > opts.tail then
+		-- roblox-ts arrays don't expose .slice; manual tail copy.
+		local tailed = {}
+		local start = #result - opts.tail
+		do
+			local i = start
+			local _shouldIncrement = false
+			while true do
+				if _shouldIncrement then
+					i += 1
+				else
+					_shouldIncrement = true
+				end
+				if not (i < #result) then
+					break
+				end
+				local _arg0 = result[i + 1]
+				table.insert(tailed, _arg0)
+			end
+		end
+		result = tailed
+	end
+	local last = if #entries > 0 then entries[#entries] else nil
+	local _object = {
+		capturedBy = capturedBy,
+		entries = result,
+		totalDropped = totalDropped,
+	}
+	local _left = "nextSince"
+	local _result_1
+	if last then
+		_result_1 = last.seq
+	else
+		local _condition = opts.since
+		if _condition == nil then
+			_condition = 0
+		end
+		_result_1 = _condition
+	end
+	_object[_left] = _result_1
+	return _object
+end
+return {
+	install = install,
+	detectPeer = detectPeer,
+	query = query,
+}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">State</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5193,7 +6405,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">UI</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5913,7 +7125,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">Utils</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6450,11 +7662,11 @@ return {
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="21">
+    <Item class="Folder" referent="26">
       <Properties>
         <string name="Name">include</string>
       </Properties>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Promise</string>
           <string name="Source"><![CDATA[--[[
@@ -8528,7 +9740,7 @@ return Promise
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">RuntimeLib</string>
           <string name="Source"><![CDATA[local Promise = require(script.Parent.Promise)
@@ -8795,15 +10007,15 @@ return TS
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="22">
+    <Item class="Folder" referent="27">
       <Properties>
         <string name="Name">node_modules</string>
       </Properties>
-      <Item class="Folder" referent="23">
+      <Item class="Folder" referent="28">
         <Properties>
           <string name="Name">@rbxts</string>
         </Properties>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">services</string>
           <string name="Source"><![CDATA[return setmetatable({}, {
