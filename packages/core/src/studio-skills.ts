@@ -8,11 +8,11 @@ import {
 import * as path from 'path';
 import { decompress as decompressZstd } from 'fzstd';
 import { resolveStudioExe } from './studio-exe.js';
+import { ROBLOX_BINARY_SIGNATURE, ZSTD_MAGIC } from './rbxl.js';
 
-const RBXM_MAGIC = Buffer.from('<roblox!\x89\xff\r\n\x1a\n', 'latin1');
+const RBXM_MAGIC = ROBLOX_BINARY_SIGNATURE;
 const RBXM_HEADER_BYTES = 32;
 const RBXM_CHUNK_HEADER_BYTES = 16;
-const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
 const STRING_PROPERTY_TYPE = 0x01;
 const MAX_DISCOVERY_DEPTH = 6;
 

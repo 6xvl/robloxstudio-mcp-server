@@ -4,6 +4,7 @@ import { runBuildExecutor, computeBoundsFromParts } from './build-executor.js';
 import { OpenCloudClient } from '../opencloud-client.js';
 import { RobloxCookieClient } from '../roblox-cookie-client.js';
 import { rgbaToPng } from '../png-encoder.js';
+import { listScripts, patchScriptSources, readPlace, type RbxlScript } from '../rbxl.js';
 import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
 import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
 import { StudioInstanceManager } from '../studio-instance-manager.js';
@@ -2532,4 +2533,162 @@ export class RobloxStudioTools {
       content: [{ type: 'text', text: JSON.stringify({ action, ...bundleMetadata, skill }) }],
     };
   }
+
+  private async readStudioSources(scriptPaths: string[]): Promise<Map<string, string>> {
+    const sources = new Map<string, string>();
+
+    for (const requested of scriptPaths) {
+      const response = await this.client.request('/api/get-script-source', {
+        instancePath: requested,
+      });
+      if (response.error) {
+        throw new Error(`Cannot read ${requested} from Studio: ${response.error}`);
+      }
+      sources.set(stripGamePrefix(requested), response.source as string);
+    }
+
+    return sources;
+  }
+
+  async placeCheck(universeId: number, placeId: number, scriptPaths: string[]) {
+    requirePlaceArgs(universeId, placeId, scriptPaths);
+
+    const live = readPlace(await this.cookieClient.downloadPlace(placeId));
+    const allLiveScripts = listScripts(live);
+    const liveScripts = new Map(allLiveScripts.map((s) => [s.path, s.source]));
+    const studioSources = await this.readStudioSources(scriptPaths);
+
+    const comparison = [...studioSources].map(([path, studioSource]) => {
+      const liveSource = liveScripts.get(path);
+      return {
+        path,
+        status: liveSource === undefined
+          ? 'missing-in-live'
+          : liveSource === studioSource
+            ? 'identical'
+            : 'differs',
+        liveLength: liveSource?.length ?? 0,
+        studioLength: studioSource.length,
+      };
+    });
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          universeId,
+          placeId,
+          liveScriptCount: allLiveScripts.length,
+          wouldPublish: comparison.filter((entry) => entry.status === 'differs').map((e) => e.path),
+          comparison,
+        }, null, 2),
+      }],
+    };
+  }
+
+  async placePublish(
+    universeId: number,
+    placeId: number,
+    scriptPaths: string[],
+    restartServers = false
+  ) {
+    requirePlaceArgs(universeId, placeId, scriptPaths);
+
+    const studioSources = await this.readStudioSources(scriptPaths);
+    const live = readPlace(await this.cookieClient.downloadPlace(placeId));
+    const before = listScripts(live);
+    const patch = patchScriptSources(live, studioSources);
+
+    if (patch.missing.length > 0) {
+      throw new Error(
+        `Not published. These scripts do not exist in place ${placeId}: ${patch.missing.join(', ')}`
+      );
+    }
+    if (patch.ambiguous.length > 0) {
+      throw new Error(
+        `Not published. More than one instance has these paths, so the target is unknowable: ${patch.ambiguous.join(', ')}`
+      );
+    }
+
+    const drift = collectUnintendedChanges(before, listScripts(readPlace(patch.bytes)), studioSources);
+    if (drift.length > 0) {
+      throw new Error(
+        `Not published. Patching changed ${drift.length} script(s) that were not requested: ${drift.slice(0, 5).join(', ')}`
+      );
+    }
+
+    const versionBefore = await this.cookieClient.latestPublishedVersion(placeId);
+
+    let versionNumber: number;
+    let publishError: string | undefined;
+    try {
+      versionNumber = (await this.openCloudClient.publishPlaceVersion(universeId, placeId, patch.bytes))
+        .versionNumber;
+    } catch (error) {
+      // A 5xx can land after the version was created. Ask what is actually published before
+      // reporting failure, so nobody republishes and creates a duplicate version.
+      publishError = error instanceof Error ? error.message : String(error);
+      const versionAfter = await this.cookieClient.latestPublishedVersion(placeId);
+      if (versionAfter === null || versionAfter === versionBefore) throw error;
+      versionNumber = versionAfter;
+    }
+
+    const version = { versionNumber };
+
+    // Verify against the exact version just created. Asset delivery serves a stale "latest"
+    // for a while after publishing, so an unversioned re-download reports a false mismatch.
+    const publishedScripts = new Map(
+      listScripts(readPlace(await this.cookieClient.downloadPlace(placeId, version.versionNumber)))
+        .map((s) => [s.path, s.source])
+    );
+    const notLive = [...studioSources]
+      .filter(([path, source]) => publishedScripts.get(path) !== source)
+      .map(([path]) => path);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          universeId,
+          placeId,
+          versionNumber: version.versionNumber,
+          publishError,
+          patched: patch.patched,
+          unchanged: scriptPaths.length - patch.patched.length,
+          verifiedLive: notLive.length === 0,
+          notLive,
+          serversRestarted: restartServers
+            ? await this.openCloudClient.restartServers(universeId, [placeId]).then(() => true)
+            : false,
+        }, null, 2),
+      }],
+    };
+  }
+}
+
+function stripGamePrefix(path: string): string {
+  return path.replace(/^game\./, '');
+}
+
+function requirePlaceArgs(universeId: number, placeId: number, scriptPaths: string[]): void {
+  if (!universeId || !placeId) {
+    throw new Error('universeId and placeId are required');
+  }
+  if (!Array.isArray(scriptPaths) || scriptPaths.length === 0) {
+    throw new Error('scriptPaths must list at least one script to compare or publish');
+  }
+}
+
+function collectUnintendedChanges(
+  before: RbxlScript[],
+  after: RbxlScript[],
+  requested: Map<string, string>
+): string[] {
+  const changed: string[] = [];
+  for (let i = 0; i < before.length; i++) {
+    if (before[i].path === after[i]?.path && before[i].source === after[i].source) continue;
+    if (requested.has(before[i].path)) continue;
+    changed.push(before[i].path);
+  }
+  return changed;
 }

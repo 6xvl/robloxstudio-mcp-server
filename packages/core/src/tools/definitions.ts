@@ -1292,6 +1292,46 @@ part(0,2,0,2,1,1,"b")`,
     }
   },
   {
+    name: 'place_check',
+    category: 'read',
+    description: 'Compare the live published place against the scripts currently open in Studio, without changing anything. Downloads the published .rbxl (needs ROBLOSECURITY) and reports, per script, whether the live copy is identical, differs, or is missing. Use before place_publish to see exactly what would go out.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        universeId: { type: 'number', description: 'Universe ID that owns the place' },
+        placeId: { type: 'number', description: 'Place ID to compare against' },
+        scriptPaths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Script instance paths to compare, e.g. "ReplicatedStorage.Modules.Stage". A leading "game." is optional.'
+        }
+      },
+      required: ['universeId', 'placeId', 'scriptPaths']
+    }
+  },
+  {
+    name: 'place_publish',
+    category: 'write',
+    description: 'Publish specific script edits from Studio to a live place WITHOUT pushing the rest of the open file. Downloads the published .rbxl, replaces only the named scripts\' Source, verifies no other script changed, publishes via Open Cloud (needs ROBLOX_OPEN_CLOUD_API_KEY with universe-places:write), then re-downloads to confirm the new source is live. Refuses to publish if a script is missing, if a path is held by more than one instance, or if patching would alter anything not requested. Use when the Studio file is a different place (e.g. a test place) than the target.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        universeId: { type: 'number', description: 'Universe ID that owns the place' },
+        placeId: { type: 'number', description: 'Place ID to publish to' },
+        scriptPaths: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Script instance paths whose Studio source should be published'
+        },
+        restartServers: {
+          type: 'boolean',
+          description: 'Restart running servers for this place only, so players get the new version (default false)'
+        }
+      },
+      required: ['universeId', 'placeId', 'scriptPaths']
+    }
+  },
+  {
     name: 'upload_asset',
     category: 'write',
     description: 'Upload any supported asset type to Roblox: Audio (mp3/ogg/wav/flac), Decal (png/jpg/bmp/tga), Model (fbx/gltf/glb/rbxm/rbxmx), Animation (rbxm/rbxmx), or Video (mp4/mov). Decal supports ROBLOSECURITY cookie auth or ROBLOX_OPEN_CLOUD_API_KEY. All other types require Open Cloud API key with asset:write scope + creator ID. Audio: max 7 min, 100 uploads/month (ID-verified). Video: max 5 min, requires 13+ ID-verified.',

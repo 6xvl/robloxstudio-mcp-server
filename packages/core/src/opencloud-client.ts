@@ -1,3 +1,5 @@
+import { readCredential } from './env-file.js';
+
 export interface OpenCloudConfig {
   apiKey?: string;
   baseUrl?: string;
@@ -116,13 +118,17 @@ export interface AssetVersionsResponse {
   nextPageToken?: string;
 }
 
+export interface PlaceVersionResponse {
+  versionNumber: number;
+}
+
 export class OpenCloudClient {
   private apiKey: string;
   private baseUrl: string;
   private timeout: number;
 
   constructor(config: OpenCloudConfig = {}) {
-    this.apiKey = config.apiKey || process.env.ROBLOX_OPEN_CLOUD_API_KEY || '';
+    this.apiKey = config.apiKey || readCredential('ROBLOX_OPEN_CLOUD_API_KEY');
     this.baseUrl = config.baseUrl || 'https://apis.roblox.com';
     this.timeout = config.timeout || 30000;
   }
@@ -434,5 +440,41 @@ export class OpenCloudClient {
     throw new Error(
       `Asset upload timed out after ${(maxAttempts * intervalMs) / 1000}s. Operation ID: ${operationId}`
     );
+  }
+
+  async publishPlaceVersion(
+    universeId: number,
+    placeId: number,
+    placeFile: Buffer,
+    versionType: 'Published' | 'Saved' = 'Published'
+  ): Promise<PlaceVersionResponse> {
+    if (!this.apiKey) {
+      throw new Error(
+        'Open Cloud API key not configured. Set ROBLOX_OPEN_CLOUD_API_KEY (needs universe-places:write).'
+      );
+    }
+
+    const url = `${this.baseUrl}/universes/v1/${universeId}/places/${placeId}/versions?versionType=${versionType}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'x-api-key': this.apiKey, 'Content-Type': 'application/octet-stream' },
+      body: new Uint8Array(placeFile),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(
+        `Publishing place ${placeId} to universe ${universeId} failed (${response.status}): ${body}`
+      );
+    }
+
+    return (await response.json()) as PlaceVersionResponse;
+  }
+
+  async restartServers(universeId: number, placeIds?: number[]): Promise<void> {
+    await this.request(`/cloud/v2/universes/${universeId}:restartServers`, {
+      method: 'POST',
+      body: { placeIds: placeIds ?? [], closeAllVersions: false },
+    });
   }
 }
