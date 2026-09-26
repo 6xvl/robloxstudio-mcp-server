@@ -596,6 +596,10 @@ function bindPort(app: express.Express, host: string, port: number): Promise<htt
     const server = http.createServer(app);
     const onError = (err: NodeJS.ErrnoException) => {
       server.removeListener('error', onError);
+      // A failed listen still holds its socket until closed. A proxy retries promotion
+      // every 5s, so without this it leaked one socket per try: 2,032 on one process,
+      // which ran Windows out of ephemeral ports ("No buffer space available").
+      server.close();
       reject(err);
     };
     server.once('error', onError);
