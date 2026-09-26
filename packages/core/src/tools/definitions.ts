@@ -1312,7 +1312,7 @@ part(0,2,0,2,1,1,"b")`,
   {
     name: 'place_publish',
     category: 'write',
-    description: 'Publish specific script edits from Studio to a live place WITHOUT pushing the rest of the open file. Downloads the published .rbxl, replaces only the named scripts\' Source, verifies no other script changed, publishes via Open Cloud (needs ROBLOX_OPEN_CLOUD_API_KEY with universe-places:write), then re-downloads to confirm the new source is live. Refuses to publish if a script is missing, if a path is held by more than one instance, or if patching would alter anything not requested. Use when the Studio file is a different place (e.g. a test place) than the target.',
+    description: 'Publish specific script edits from Studio to a live place WITHOUT pushing the rest of the open file. Downloads the published .rbxl, replaces only the named scripts\' Source, verifies no other script changed, publishes via Open Cloud (needs ROBLOX_OPEN_CLOUD_API_KEY with universe-places:write), then re-downloads to confirm the new source is live. Refuses to publish if a script is missing, if a path is held by more than one instance, if patching would alter anything not requested, if a script does not compile in Studio, or if a script would lose over 25% of its lines (allowShrink overrides). Builds on the exact latest published version, and only restarts servers once the new version is verified. Use when the Studio file is a different place (e.g. a test place) than the target.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1325,7 +1325,11 @@ part(0,2,0,2,1,1,"b")`,
         },
         restartServers: {
           type: 'boolean',
-          description: 'Restart running servers for this place only, so players get the new version (default false)'
+          description: 'Restart running servers for this place only, so players get the new version (default false). Skipped automatically if the published version fails verification.'
+        },
+        allowShrink: {
+          type: 'boolean',
+          description: 'Allow publishing a script that loses more than 25% of its lines versus live. Refused by default because that is what a partial read looks like (default false)'
         }
       },
       required: ['universeId', 'placeId', 'scriptPaths']

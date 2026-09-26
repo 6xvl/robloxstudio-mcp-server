@@ -5,6 +5,7 @@ import { OpenCloudClient } from '../opencloud-client.js';
 import { RobloxCookieClient } from '../roblox-cookie-client.js';
 import { rgbaToPng } from '../png-encoder.js';
 import { listScripts, patchScriptSources, readPlace, type RbxlScript } from '../rbxl.js';
+import { buildCompileCheckLuau, findSuspiciousShrinks, lineCount, MAX_LINE_LOSS, parseCompileCheck } from '../publish-guards.js';
 import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
 import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
 import { StudioInstanceManager } from '../studio-instance-manager.js';
@@ -2538,22 +2539,56 @@ export class RobloxStudioTools {
     const sources = new Map<string, string>();
 
     for (const requested of scriptPaths) {
+      // An explicit range, because an unranged read of a script over 50,000 characters comes
+      // back cut to its first 1,000 lines. Publishing that shipped a 3,776-line GeneralService
+      // as 999 lines to live places.
       const response = await this.client.request('/api/get-script-source', {
         instancePath: requested,
+        startLine: 1,
+        endLine: Number.MAX_SAFE_INTEGER,
       });
       if (response.error) {
         throw new Error(`Cannot read ${requested} from Studio: ${response.error}`);
       }
-      sources.set(stripGamePrefix(requested), response.source as string);
+      const source = response.source as string;
+      // sourceLength is Luau's #source, a byte count
+      const byteLength = Buffer.byteLength(source, 'utf8');
+      if (response.truncated || byteLength !== response.sourceLength) {
+        throw new Error(
+          `Studio returned ${byteLength} of ${response.sourceLength} bytes for ${requested}; refusing to use a partial source`,
+        );
+      }
+      sources.set(stripGamePrefix(requested), source);
     }
 
     return sources;
   }
 
+  /**
+   * The unversioned download serves a stale copy for a while after a publish. Patching that
+   * silently reverted the newer version's changes, so both tools read the exact latest version.
+   */
+  private async downloadLatestVersion(placeId: number): Promise<Buffer> {
+    const version = await this.cookieClient.latestPublishedVersion(placeId);
+    if (version === null) {
+      throw new Error(`Cannot read the latest published version of place ${placeId}; refusing to work from a possibly stale copy`);
+    }
+    return this.cookieClient.downloadPlace(placeId, version);
+  }
+
+  /** Compiles each script's Studio source with loadstring; returns "path: error" per failure. */
+  private async compileCheckInStudio(scriptPaths: string[]): Promise<string[]> {
+    const response = await this.client.request('/api/execute-luau', {
+      code: buildCompileCheckLuau(scriptPaths.map(stripGamePrefix)),
+    }, 'edit') as { output?: unknown; error?: string };
+    if (response.error) throw new Error(`Compile check failed to run in Studio: ${response.error}`);
+    return parseCompileCheck(response.output);
+  }
+
   async placeCheck(universeId: number, placeId: number, scriptPaths: string[]) {
     requirePlaceArgs(universeId, placeId, scriptPaths);
 
-    const live = readPlace(await this.cookieClient.downloadPlace(placeId));
+    const live = readPlace(await this.downloadLatestVersion(placeId));
     const allLiveScripts = listScripts(live);
     const liveScripts = new Map(allLiveScripts.map((s) => [s.path, s.source]));
     const studioSources = await this.readStudioSources(scriptPaths);
@@ -2569,8 +2604,11 @@ export class RobloxStudioTools {
             : 'differs',
         liveLength: liveSource?.length ?? 0,
         studioLength: studioSource.length,
+        liveLines: liveSource === undefined ? 0 : lineCount(liveSource),
+        studioLines: lineCount(studioSource),
       };
     });
+    const suspiciousShrinks = findSuspiciousShrinks(liveScripts, studioSources);
 
     return {
       content: [{
@@ -2580,6 +2618,7 @@ export class RobloxStudioTools {
           placeId,
           liveScriptCount: allLiveScripts.length,
           wouldPublish: comparison.filter((entry) => entry.status === 'differs').map((e) => e.path),
+          suspiciousShrinks,
           comparison,
         }, null, 2),
       }],
@@ -2590,13 +2629,28 @@ export class RobloxStudioTools {
     universeId: number,
     placeId: number,
     scriptPaths: string[],
-    restartServers = false
+    restartServers = false,
+    allowShrink = false
   ) {
     requirePlaceArgs(universeId, placeId, scriptPaths);
 
     const studioSources = await this.readStudioSources(scriptPaths);
-    const live = readPlace(await this.cookieClient.downloadPlace(placeId));
+    const live = readPlace(await this.downloadLatestVersion(placeId));
     const before = listScripts(live);
+
+    const shrinks = findSuspiciousShrinks(new Map(before.map((s) => [s.path, s.source])), studioSources);
+    if (shrinks.length > 0 && !allowShrink) {
+      throw new Error(
+        `Not published. These scripts would lose over ${MAX_LINE_LOSS * 100}% of their lines, which is what a partial ` +
+        `read looks like: ${shrinks.join('; ')}. If the deletion is intended, pass allowShrink: true.`
+      );
+    }
+
+    const compileFailures = await this.compileCheckInStudio(scriptPaths);
+    if (compileFailures.length > 0) {
+      throw new Error(`Not published. These scripts do not compile: ${compileFailures.join('; ')}`);
+    }
+
     const patch = patchScriptSources(live, studioSources);
 
     if (patch.missing.length > 0) {
@@ -2645,6 +2699,13 @@ export class RobloxStudioTools {
       .filter(([path, source]) => publishedScripts.get(path) !== source)
       .map(([path]) => path);
 
+    // Never restart players onto a version that failed verification: running servers keep the
+    // last good code, and the restart can be done by hand once the publish is fixed
+    const verifiedLive = notLive.length === 0;
+    const restartSkipped = restartServers && !verifiedLive
+      ? 'Publish did not verify, so servers were NOT restarted'
+      : undefined;
+
     return {
       content: [{
         type: 'text',
@@ -2655,11 +2716,13 @@ export class RobloxStudioTools {
           publishError,
           patched: patch.patched,
           unchanged: scriptPaths.length - patch.patched.length,
-          verifiedLive: notLive.length === 0,
+          verifiedLive,
           notLive,
-          serversRestarted: restartServers
+          publishedLines: Object.fromEntries([...studioSources.keys()].map((path) => [path, lineCount(publishedScripts.get(path) ?? '')])),
+          serversRestarted: restartServers && verifiedLive
             ? await this.openCloudClient.restartServers(universeId, [placeId]).then(() => true)
             : false,
+          restartSkipped,
         }, null, 2),
       }],
     };
