@@ -1,0 +1,7 @@
+# The repo is LF. Without this, a tool that rewrites a file on Windows can flip it
+# to CRLF and every line shows as changed -- a four line edit reads as six thousand,
+# which buries real work in the diff.
+* text=auto eol=lf
+*.png binary
+*.rbxm binary
+*.rbxmx binary

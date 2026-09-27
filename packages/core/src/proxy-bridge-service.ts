@@ -75,6 +75,10 @@ export class ProxyBridgeService extends BridgeService {
   private preferred: string | null = null;
 
   override async sendRequest(endpoint: string, data: any, target = 'edit', targetInstanceId?: string): Promise<any> {
+    // Before the request leaves this process. The primary cannot make this call for us:
+    // it sees one merged queue and cannot tell an unchosen client from a chosen one.
+    this.assertUnambiguousTarget(target, targetInstanceId);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.proxyRequestTimeout);
 

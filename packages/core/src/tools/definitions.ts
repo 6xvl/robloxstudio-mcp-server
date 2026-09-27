@@ -2900,6 +2900,108 @@ part(0,2,0,2,1,1,"b")`,
       required: ['action']
     }
   },
+  {
+    name: 'debugger',
+    category: 'write',
+    description: 'Use to see the call stack and locals at a breakpoint or error without freezing it: attach, set breakpoints with the breakpoints tool, then read snapshots. Each hit is captured and resumed at once.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['attach', 'detach', 'snapshots', 'clear', 'exception_mode'],
+          description: 'attach: capture every pause. snapshots: read captures (stack, top-frame locals, watches). exception_mode: also capture on errors.'
+        },
+        target: {
+          type: 'string',
+          description: 'Peer: server (default) or client-N. Only exists during a playtest.'
+        },
+        watch: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'For attach: Luau expressions evaluated in the paused frame, e.g. "player.Name".'
+        },
+        since: {
+          type: 'number',
+          description: 'For snapshots: only those with index greater than this.'
+        },
+        tail: {
+          type: 'number',
+          description: 'For snapshots: newest N to return; default 5 (up to 20 kept).'
+        },
+        include_globals: {
+          type: 'boolean',
+          description: 'For attach: also capture _G, shared and script in locals.'
+        },
+        mode: {
+          type: 'string',
+          description: 'For exception_mode: Never|Always|Unhandled.'
+        }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'script_editor',
+    category: 'write',
+    description: 'Use to work with Studio script editor tabs: list open tabs, read unsaved text, open a script at a line, edit through the editor (undoable, or reviewable diffs the user accepts), and push warnings into Script Analysis.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['documents', 'read', 'open', 'edit', 'diagnostics_set', 'clear', 'list'],
+          description: 'documents: open tabs. read: editor text incl. unsaved. edit: apply edits in the editor. diagnostics_set/clear/list: Script Analysis entries.'
+        },
+        path: {
+          type: 'string',
+          description: 'Script path; required for read, open, edit, diagnostics_set; optional for clear.'
+        },
+        line: {
+          type: 'number',
+          description: 'For open/edit: line to highlight.'
+        },
+        reviewable: {
+          type: 'boolean',
+          description: 'For edit: show as inline diffs for the user to accept or reject instead of applying.'
+        },
+        edits: {
+          type: 'array',
+          description: 'For edit: [{text, start_line, end_line, start_character?, end_character?}]. Reviewable: whole lines, end_line optional (omit to insert).',
+          items: { type: 'object' }
+        },
+        diagnostics: {
+          type: 'array',
+          description: 'For diagnostics_set: [{line, message, severity? (Error|Warning|Information|Hint), end_line?, start_character?, end_character?, code?}]. Empty clears.',
+          items: { type: 'object' }
+        }
+      },
+      required: ['action']
+    }
+  },
+  {
+    name: 'reload_plugin',
+    category: 'write',
+    description: 'Use after rebuilding the MCP plugin (npm run build:plugin) to load the new tool code into the running Studio without reopening the place. Edit mode only; UI and poll-loop changes still need a reopen.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'studio_activity',
+    category: 'read',
+    description: 'Use before editing a shared place: who is in Team Create and on which line, plus recent undo/redo/edits/tab activity in this Studio.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        since: {
+          type: 'number',
+          description: 'Unix time; only events at or after it.'
+        }
+      }
+    }
+  },
 
   // === Selection and .rbxm round-trip ===
   {
@@ -2916,6 +3018,66 @@ part(0,2,0,2,1,1,"b")`,
         from: { type: 'number', description: 'Compass angle in degrees to view from.' },
         angleY: { type: 'number', description: 'Elevation in degrees, -89 to 89.' }
       }
+    }
+  },
+  {
+    name: 'source_pull',
+    category: 'read',
+    description: "Write the place's scripts to disk as a Rojo-layout folder tree, plus a manifest. This is what makes git, ripgrep, luau-analyze and editing with Studio closed possible. SOURCE TEXT ONLY -- it never creates, renames or deletes an instance.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        out_dir: { type: 'string', description: 'Folder to write into. Created if absent.' },
+        roots: { type: 'array', items: { type: 'string' }, description: 'Service names to pull. Defaults to the code services (ReplicatedStorage, ServerScriptService, StarterPlayer, StarterGui, ServerStorage, Workspace, ReplicatedFirst, Lighting, SoundService).' },
+        exclude: { type: 'array', items: { type: 'string' }, description: 'Instance path prefixes to skip, e.g. "game.ServerStorage.OldBackup". A stale backup folder can be a third of the place and it makes every later search noisier.' },
+        batch_size: { type: 'number', description: 'Scripts per bridge round trip (default 25, max 200).' },
+        dry_run: { type: 'boolean', description: 'Report what would be written and write nothing.' }
+      },
+      required: ['out_dir']
+    }
+  },
+  {
+    name: 'source_push',
+    category: 'write',
+    description: 'Apply edited files from a source_pull folder back into the place. Only files whose contents changed are sent, matched through the manifest rather than guessed from filenames. Never creates or deletes an instance.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        in_dir: { type: 'string', description: 'A folder a previous source_pull wrote.' },
+        only: { type: 'array', items: { type: 'string' }, description: 'Limit to relative paths starting with one of these prefixes.' },
+        dry_run: { type: 'boolean', description: 'List what changed without writing to the place.' }
+      },
+      required: ['in_dir']
+    }
+  },
+  {
+    name: 'source_snapshot',
+    category: 'write',
+    description: 'Pull the scripts into a git repository and commit them. The history a place file cannot keep: diff, blame and revert. Initialises the repo on first use and skips the commit when nothing changed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dir: { type: 'string', description: 'Repository folder. Created and git-init-ed if needed.' },
+        message: { type: 'string', description: 'Commit message. Defaults to a timestamp.' },
+        roots: { type: 'array', items: { type: 'string' }, description: 'Passed through to source_pull.' },
+        exclude: { type: 'array', items: { type: 'string' }, description: 'Passed through to source_pull.' }
+      },
+      required: ['dir']
+    }
+  },
+  {
+    name: 'luau_check',
+    category: 'read',
+    description: "Run luau-lsp (or another checker) over a pulled tree and return its diagnostics. The one capability the Studio bridge cannot provide: a clean parse is not verification, and an undeclared global resolves to nil and ships. Reports a missing binary with the command to install it rather than failing obscurely.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dir: { type: 'string', description: 'A folder a previous source_pull wrote.' },
+        tool: { type: 'string', description: 'Binary to run. Default "luau-lsp" (analyze mode), which is the only one that can load Roblox type definitions. "luau-analyze" and "selene" also work but cannot.' },
+        definitions: { type: 'string', description: 'Path to globalTypes.d.luau. Found automatically from the tree or the bundled copy; without it every Roblox global reads as an unknown-global error.' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Extra arguments placed before the directory.' }
+      },
+      required: ['dir']
     }
   },
   {

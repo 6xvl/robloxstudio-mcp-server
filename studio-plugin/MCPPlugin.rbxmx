@@ -12,6 +12,8 @@ local UI = TS.import(script, script, "modules", "UI")
 local Communication = TS.import(script, script, "modules", "Communication")
 local RuntimeLogBuffer = TS.import(script, script, "modules", "RuntimeLogBuffer")
 local BreakpointHandlers = TS.import(script, script, "modules", "handlers", "BreakpointHandlers")
+local EditorHandlers = TS.import(script, script, "modules", "handlers", "EditorHandlers")
+local ReloadHandlers = TS.import(script, script, "modules", "handlers", "ReloadHandlers")
 local _EvalBridges = TS.import(script, script, "modules", "EvalBridges")
 local cleanupLegacyEditBridges = _EvalBridges.cleanupLegacyEditBridges
 local ensureRuntimeBridgeInstalled = _EvalBridges.ensureRuntimeBridgeInstalled
@@ -20,6 +22,8 @@ local ensureRuntimeBridgeInstalled = _EvalBridges.ensureRuntimeBridgeInstalled
 RuntimeLogBuffer.install()
 -- Breakpoints are stored through plugin:SetSetting, so the module needs the handle.
 BreakpointHandlers.init(plugin)
+EditorHandlers.init()
+ReloadHandlers.init(plugin)
 UI.init(plugin)
 local elements = UI.getElements()
 -- WHICH DATAMODEL THIS COPY OF THE PLUGIN IS IN. A playtest forks the DataModel, and the
@@ -27,7 +31,8 @@ local elements = UI.getElements()
 -- play server, and one per play client. Everything below that says "peer" means one of
 -- those, and the MCP bridge addresses them by exactly this name.
 local function peerRole()
-	if not RunService:IsRunMode() then
+	-- IsRunMode is true only for a Run playtest, so Play-mode peers used to report as edit.
+	if not RunService:IsRunning() then
 		return "edit"
 	end
 	if RunService:IsServer() then
@@ -181,11 +186,15 @@ local MicroProfilerHandlers = TS.import(script, script.Parent, "handlers", "Micr
 local MemoryHandlers = TS.import(script, script.Parent, "handlers", "MemoryHandlers")
 local SceneAnalysisHandlers = TS.import(script, script.Parent, "handlers", "SceneAnalysisHandlers")
 local BreakpointHandlers = TS.import(script, script.Parent, "handlers", "BreakpointHandlers")
+local DebuggerHandlers = TS.import(script, script.Parent, "handlers", "DebuggerHandlers")
+local EditorHandlers = TS.import(script, script.Parent, "handlers", "EditorHandlers")
+local ReloadHandlers = TS.import(script, script.Parent, "handlers", "ReloadHandlers")
 local MultiplayerTestHandlers = TS.import(script, script.Parent, "handlers", "MultiplayerTestHandlers")
 local instanceId = HttpService:GenerateGUID(false)
 local assignedRole
 local function detectRole()
-	if not RunService:IsRunMode() then
+	-- IsRunMode is true only for a Run playtest, so Play-mode peers used to report as edit.
+	if not RunService:IsRunning() then
 		return "edit"
 	end
 	if RunService:IsServer() then
@@ -245,6 +254,9 @@ local routeMap = {
 	["/api/get-memory-breakdown"] = MemoryHandlers.getMemoryBreakdown,
 	["/api/get-scene-analysis"] = SceneAnalysisHandlers.getSceneAnalysis,
 	["/api/breakpoints"] = BreakpointHandlers.breakpoints,
+	["/api/debugger"] = DebuggerHandlers.debuggerAction,
+	["/api/script-editor"] = EditorHandlers.scriptEditor,
+	["/api/studio-activity"] = EditorHandlers.studioActivity,
 	["/api/multiplayer-test-start"] = MultiplayerTestHandlers.multiplayerTestStart,
 	["/api/multiplayer-test-state"] = MultiplayerTestHandlers.multiplayerTestState,
 	["/api/multiplayer-test-add-players"] = MultiplayerTestHandlers.multiplayerTestAddPlayers,
@@ -255,6 +267,7 @@ local routeMap = {
 	["/api/bulk-set-attributes"] = MetadataHandlers.bulkSetAttributes,
 	["/api/start-playtest"] = TestHandlers.startPlaytest,
 	["/api/stop-playtest"] = TestHandlers.stopPlaytest,
+	["/api/end-test"] = TestHandlers.endTest,
 	["/api/get-playtest-output"] = TestHandlers.getPlaytestOutput,
 	["/api/character-navigation"] = TestHandlers.characterNavigation,
 	["/api/export-build"] = BuildHandlers.exportBuild,
@@ -268,10 +281,20 @@ local routeMap = {
 	["/api/simulate-keyboard-input"] = InputHandlers.simulateKeyboardInput,
 	["/api/find-and-replace-in-scripts"] = ScriptHandlers.findAndReplaceInScripts,
 }
+-- Set by a hot reload: requests go to the freshly loaded handlers instead of this module's.
+local routeOverride
+local function setRouteOverride(routes)
+	routeOverride = routes
+end
 local function processRequest(request)
 	local endpoint = request.endpoint
 	local data = request.data or {}
-	local handler = routeMap[endpoint]
+	-- Always served by this (the live poll loop's) copy, so every reload swaps the routes this
+	-- loop actually uses, not those of a previously reloaded copy.
+	if endpoint == "/api/reload-plugin" then
+		return ReloadHandlers.reloadPlugin(data, setRouteOverride)
+	end
+	local handler = (routeOverride or routeMap)[endpoint]
 	if handler then
 		return handler(data)
 	else
@@ -401,6 +424,13 @@ local function pollForRequests(connIndex)
 			end)
 		end
 	elseif conn.isActive then
+		-- Once per connection: without this a peer that can never reach the MCP (seen with the
+		-- Play-mode client copy) just shows "connecting" forever with no reason anywhere.
+		if not conn.loggedPollFailure then
+			conn.loggedPollFailure = true
+			local reason = if success then `HTTP {result.StatusCode} {result.StatusMessage}` else tostring(result)
+			warn(`[MCP] {detectRole()} peer cannot reach {conn.serverUrl}: {reason}`)
+		end
 		conn.consecutiveFailures += 1
 		if conn.consecutiveFailures > 1 then
 			conn.currentRetryDelay = math.min(conn.currentRetryDelay * conn.retryBackoffMultiplier, conn.maxRetryDelay)
@@ -609,6 +639,7 @@ local function checkForUpdates()
 	end)
 end
 return {
+	routes = routeMap,
 	getConnectionStatus = getConnectionStatus,
 	activatePlugin = activatePlugin,
 	deactivatePlugin = deactivatePlugin,
@@ -2434,6 +2465,802 @@ return {
         </Item>
         <Item class="ModuleScript" referent="9">
           <Properties>
+            <string name="Name">DebuggerHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+-- ScriptDebuggerService is Plugin security and not in @rbxts/types yet. Shapes are from
+-- Studio's bundled api_docs (content/api_docs/en-us.json, 0.740.19).
+-- Why snapshots and not a live pause: a pause freezes the whole DataModel, including this
+-- plugin's poll loop and any HTTP call made from the callback (probed live 2026-09-26: the
+-- server peer dropped off the bridge and a GetAsync inside OnStopped never returned). So the
+-- callback reads everything it can without yielding and resumes at once.
+local MAX_SNAPSHOTS = 20
+local MAX_FRAMES = 12
+local DEFAULT_TAIL = 5
+-- DebuggerResumeType and DebugBreakModeType are missing from @rbxts/types.
+local Enums = Enum
+local BREAK_MODES = { "Never", "Always", "Unhandled" }
+local debuggerService = game:GetService("ScriptDebuggerService")
+local attached = false
+local watchExpressions = {}
+local includeGlobals = false
+local snapshotCount = 0
+local snapshots = {}
+-- EnumItems and Instances do not survive JSONEncode, so everything leaves as plain data.
+local function plain(value, depth)
+	if depth == nil then
+		depth = 0
+	end
+	if depth > 8 then
+		return tostring(value)
+	end
+	local _value = value
+	if type(_value) == "table" then
+		local out = {}
+		for k, v in pairs(value) do
+			out[tostring(k)] = plain(v, depth + 1)
+		end
+		return out
+	end
+	local _value_1 = value
+	local _condition = type(_value_1) == "string"
+	if not _condition then
+		local _value_2 = value
+		_condition = type(_value_2) == "number"
+		if not _condition then
+			local _value_3 = value
+			_condition = type(_value_3) == "boolean"
+		end
+	end
+	if _condition then
+		return value
+	end
+	local _value_2 = value
+	if typeof(_value_2) == "EnumItem" then
+		return value.Name
+	end
+	local _value_3 = value
+	if typeof(_value_3) == "Instance" then
+		return value:GetFullName()
+	end
+	return if value == nil then nil else tostring(value)
+end
+local function capture(info)
+	local snapshot = {
+		index = snapshotCount + 1,
+		at = os.time(),
+		reason = plain(info.Reason),
+		exceptionText = info.ExceptionText,
+	}
+	local thread = debuggerService:GetThreads()[1]
+	if not thread then
+		return snapshot
+	end
+	snapshot.thread = plain(thread)
+	local _exp = (debuggerService:GetStackTrace(thread.Id).Frames or {})
+	-- ▼ ReadonlyArray.filter ▼
+	local _newValue = {}
+	local _callback = function(_, i)
+		return i < MAX_FRAMES
+	end
+	local _length = 0
+	for _k, _v in _exp do
+		if _callback(_v, _k - 1, _exp) == true then
+			_length += 1
+			_newValue[_length] = _v
+		end
+	end
+	-- ▲ ReadonlyArray.filter ▲
+	local frames = _newValue
+	snapshot.stack = plain(frames)
+	local top = frames[1]
+	if not top then
+		return snapshot
+	end
+	-- _G, shared and script appear in every frame and bury the locals that matter.
+	local variables = debuggerService:GetRootVariables(top.Id)
+	-- ▼ ReadonlyArray.filter ▼
+	local _newValue_1 = {}
+	local _callback_1 = function(v)
+		local _condition = includeGlobals
+		if not _condition then
+			local _result = v.Scope
+			if _result ~= nil then
+				_result = _result.Name
+			end
+			_condition = _result ~= "Global"
+		end
+		return _condition
+	end
+	local _length_1 = 0
+	for _k, _v in variables do
+		if _callback_1(_v, _k - 1, variables) == true then
+			_length_1 += 1
+			_newValue_1[_length_1] = _v
+		end
+	end
+	-- ▲ ReadonlyArray.filter ▲
+	snapshot.locals = plain(_newValue_1)
+	local watches = {}
+	for _, expression in watchExpressions do
+		local ok, result = pcall(function()
+			return debuggerService:Evaluate(expression, top.Id)
+		end)
+		watches[expression] = if ok then plain(result) else `error: {tostring(result)}`
+	end
+	snapshot.watches = watches
+	return snapshot
+end
+-- Must never yield or throw: either one leaves the game paused with nobody to resume it.
+local function onStopped(info)
+	local ok, snapshot = pcall(capture, info)
+	snapshotCount += 1
+	local _arg0 = if ok then snapshot else {
+		index = snapshotCount,
+		at = os.time(),
+		error = tostring(snapshot),
+	}
+	table.insert(snapshots, _arg0)
+	if #snapshots > MAX_SNAPSHOTS then
+		table.remove(snapshots, 1)
+	end
+	return {
+		steppedType = Enums.DebuggerResumeType.Resume,
+	}
+end
+local function debuggerAction(requestData)
+	local action = requestData.action
+	if action == "attach" then
+		local watch = requestData.watch
+		includeGlobals = requestData.include_globals == true
+		watchExpressions = {}
+		if type(watch) == "table" then
+			for _, expression in watch do
+				if type(expression) == "string" then
+					table.insert(watchExpressions, expression)
+				end
+			end
+		end
+		debuggerService.OnStopped = onStopped
+		attached = true
+		return {
+			success = true,
+			watch = watchExpressions,
+			message = "Attached. Every breakpoint hit (and exception, per exception_mode) is snapshotted and resumed immediately.",
+		}
+	end
+	if action == "detach" then
+		debuggerService.OnStopped = nil
+		attached = false
+		return {
+			success = true,
+			message = "Detached; Studio's own debugger handles pauses again.",
+		}
+	end
+	if action == "snapshots" then
+		local _since = requestData.since
+		local since = if type(_since) == "number" then requestData.since else 0
+		local _tail = requestData.tail
+		local tail = if type(_tail) == "number" then requestData.tail else DEFAULT_TAIL
+		-- ▼ ReadonlyArray.filter ▼
+		local _newValue = {}
+		local _callback = function(s)
+			return (s.index) > since
+		end
+		local _length = 0
+		for _k, _v in snapshots do
+			if _callback(_v, _k - 1, snapshots) == true then
+				_length += 1
+				_newValue[_length] = _v
+			end
+		end
+		-- ▲ ReadonlyArray.filter ▲
+		local matching = _newValue
+		local _object = {
+			attached = attached,
+			total = snapshotCount,
+		}
+		local _left = "snapshots"
+		-- ▼ ReadonlyArray.filter ▼
+		local _newValue_1 = {}
+		local _callback_1 = function(_, i)
+			return i >= #matching - tail
+		end
+		local _length_1 = 0
+		for _k, _v in matching do
+			if _callback_1(_v, _k - 1, matching) == true then
+				_length_1 += 1
+				_newValue_1[_length_1] = _v
+			end
+		end
+		-- ▲ ReadonlyArray.filter ▲
+		_object[_left] = _newValue_1
+		return _object
+	end
+	if action == "clear" then
+		table.clear(snapshots)
+		return {
+			success = true,
+		}
+	end
+	if action == "exception_mode" then
+		local mode = requestData.mode
+		if not (table.find(BREAK_MODES, mode) ~= nil) then
+			return {
+				error = `mode must be one of {table.concat(BREAK_MODES, ", ")}`,
+			}
+		end
+		debuggerService:SetExceptionBreakMode(Enums.DebugBreakModeType[mode])
+		return {
+			success = true,
+			mode = mode,
+		}
+	end
+	return {
+		error = `Unknown action: {action}`,
+	}
+end
+return {
+	debuggerAction = debuggerAction,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">EditorHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+local Utils = TS.import(script, script.Parent.Parent, "Utils")
+local _binding = Utils
+local getInstancePath = _binding.getInstancePath
+local getInstanceByPath = _binding.getInstanceByPath
+local readScriptSource = _binding.readScriptSource
+local RunService = game:GetService("RunService")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+-- ScriptEditorService/ScriptDocument members below are Plugin security; contracts are from
+-- create.roblox.com ScriptEditorService.md and Studio's bundled api_docs (0.740.19).
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local ANALYSIS_CALLBACK = "MCPDiagnostics"
+local REFRESH_CALLBACK = "MCPDiagnosticsRefresh"
+local HISTORY_LIMIT = 300
+local EDIT_BURST_SECONDS = 5
+local SEVERITIES = { "Error", "Warning", "Information", "Hint" }
+local diagnosticsByScript = {}
+local analysisRegistered = false
+local history = {}
+local function record(kind, detail, scriptPath)
+	local _arg0 = {
+		at = os.time(),
+		kind = kind,
+		detail = detail,
+		script = scriptPath,
+	}
+	table.insert(history, _arg0)
+	if #history > HISTORY_LIMIT then
+		table.remove(history, 1)
+	end
+end
+local function resolveScript(requestData)
+	local path = requestData.path
+	if not (type(path) == "string") or path == "" then
+		return nil, "path is required"
+	end
+	local instance = getInstanceByPath(path)
+	if not instance then
+		return nil, `Instance not found: {path}`
+	end
+	if not instance:IsA("LuaSourceContainer") then
+		return nil, `{path} is a {instance.ClassName}, not a script`
+	end
+	return instance, nil
+end
+local function documentPath(document)
+	local ok, target = pcall(function()
+		return document:GetScript()
+	end)
+	return if ok and target then getInstancePath(target) else nil
+end
+local function listDocuments()
+	local documents = {}
+	for _, document in ScriptEditorService:GetScriptDocuments() do
+		if document:IsCommandBar() then
+			continue
+		end
+		local cursorLine, cursorCharacter, anchorLine, anchorCharacter = document:GetSelection()
+		local target = document:GetScript()
+		local _arg0 = {
+			path = documentPath(document),
+			lineCount = document:GetLineCount(),
+			selection = {
+				cursorLine = cursorLine,
+				cursorCharacter = cursorCharacter,
+				anchorLine = anchorLine,
+				anchorCharacter = anchorCharacter,
+			},
+			unsavedChanges = if target then ScriptEditorService:GetEditorSource(target) ~= readScriptSource(target) else nil,
+		}
+		table.insert(documents, _arg0)
+	end
+	return {
+		documents = documents,
+	}
+end
+local function readEditorSource(requestData)
+	local target, err = resolveScript(requestData)
+	if not target then
+		return {
+			error = err,
+		}
+	end
+	local editorSource = ScriptEditorService:GetEditorSource(target)
+	return {
+		path = getInstancePath(target),
+		open = ScriptEditorService:FindScriptDocument(target) ~= nil,
+		unsavedChanges = editorSource ~= readScriptSource(target),
+		source = editorSource,
+	}
+end
+local function openDocument(target, requestData)
+	local line = requestData.line
+	local options = if type(line) == "number" then {
+		HighlightRange = {
+			Start = {
+				Line = line,
+				Character = 1,
+			},
+			End = {
+				Line = line,
+				Character = 1,
+			},
+		},
+	} else nil
+	local ok, err = ScriptEditorService:OpenScriptDocumentAsync(target, options)
+	return if ok then nil else `OpenScriptDocumentAsync failed: {err}`
+end
+-- Edits go through the open editor tab, so they land in the user's undo stack. `reviewable`
+-- shows them as inline diffs the user accepts or rejects instead of applying them outright.
+local function editDocument(requestData)
+	local target, err = resolveScript(requestData)
+	if not target then
+		return {
+			error = err,
+		}
+	end
+	local edits = requestData.edits
+	if not (type(edits) == "table") or #edits == 0 then
+		return {
+			error = "edits must be a non-empty array",
+		}
+	end
+	local openError = openDocument(target, requestData)
+	if openError ~= "" and openError then
+		return {
+			error = openError,
+		}
+	end
+	local document = ScriptEditorService:FindScriptDocument(target)
+	if not document then
+		return {
+			error = "The script opened but no ScriptDocument appeared",
+		}
+	end
+	local reviewable = requestData.reviewable == true
+	local converted = {}
+	for _, raw in edits do
+		local _text = raw.text
+		local _condition = not (type(_text) == "string")
+		if not _condition then
+			local _start_line = raw.start_line
+			_condition = not (type(_start_line) == "number")
+		end
+		if _condition then
+			return {
+				error = "each edit needs text and start_line",
+			}
+		end
+		if reviewable then
+			local _arg0 = {
+				Text = raw.text,
+				StartLine = raw.start_line,
+				EndLine = raw.end_line,
+			}
+			table.insert(converted, _arg0)
+		else
+			local _end_line = raw.end_line
+			if not (type(_end_line) == "number") then
+				return {
+					error = "end_line is required unless reviewable",
+				}
+			end
+			local _object = {
+				NewText = raw.text,
+				StartLine = raw.start_line,
+			}
+			local _left = "StartCharacter"
+			local _condition_1 = (raw.start_character)
+			if _condition_1 == nil then
+				_condition_1 = 1
+			end
+			_object[_left] = _condition_1
+			_object.EndLine = raw.end_line
+			local _left_1 = "EndCharacter"
+			local _condition_2 = (raw.end_character)
+			if _condition_2 == nil then
+				_condition_2 = 1
+			end
+			_object[_left_1] = _condition_2
+			table.insert(converted, _object)
+		end
+	end
+	local _binding_1 = if reviewable then { document:ReviewableTextEditsAsync(converted) } else { document:MultiEditTextAsync(converted) }
+	local ok = _binding_1[1]
+	local reason = _binding_1[2]
+	if not ok then
+		return {
+			error = `{if reviewable then "ReviewableTextEditsAsync" else "MultiEditTextAsync"} failed: {reason}`,
+		}
+	end
+	return {
+		success = true,
+		reviewable = reviewable,
+		applied = #converted,
+		lineCount = document:GetLineCount(),
+		message = if reviewable then "Diffs are shown in the editor for the user to accept or reject" else "Applied in the editor (undoable)",
+	}
+end
+local function analysisCallback(request)
+	local diagnostics = {}
+	local _result
+	if request.script then
+		local _script = request.script
+		_result = diagnosticsByScript[_script]
+	else
+		_result = nil
+	end
+	local entries = _result
+	local _result_1
+	if entries and request.script then
+		local _exp = ScriptEditorService:GetEditorSource(request.script)
+		local _arg0 = string.char(10)
+		_result_1 = string.split(_exp, _arg0)
+	else
+		_result_1 = {}
+	end
+	local lines = _result_1
+	for _, entry in entries or {} do
+		local _condition = entry.end_line
+		if _condition == nil then
+			_condition = entry.line
+		end
+		local endLine = _condition
+		-- Without an end character, underline the whole last line rather than guess a width.
+		local _condition_1 = lines[endLine]
+		if _condition_1 == nil then
+			_condition_1 = ""
+		end
+		local lineLength = #_condition_1
+		local _object = {}
+		local _left = "range"
+		local _object_1 = {}
+		local _left_1 = "start"
+		local _object_2 = {
+			line = entry.line,
+		}
+		local _left_2 = "character"
+		local _condition_2 = entry.start_character
+		if _condition_2 == nil then
+			_condition_2 = 1
+		end
+		_object_2[_left_2] = _condition_2
+		_object_1[_left_1] = _object_2
+		local _left_3 = "end"
+		local _object_3 = {
+			line = endLine,
+		}
+		local _left_4 = "character"
+		local _condition_3 = entry.end_character
+		if _condition_3 == nil then
+			_condition_3 = math.max(lineLength + 1, 2)
+		end
+		_object_3[_left_4] = _condition_3
+		_object_1[_left_3] = _object_3
+		_object[_left] = _object_1
+		local _left_5 = "code"
+		local _condition_4 = entry.code
+		if _condition_4 == nil then
+			_condition_4 = "MCP"
+		end
+		_object[_left_5] = _condition_4
+		_object.message = entry.message
+		local _left_6 = "severity"
+		local _exp = Enum.Severity
+		local _condition_5 = entry.severity
+		if _condition_5 == nil then
+			_condition_5 = "Warning"
+		end
+		_object[_left_6] = _exp[_condition_5]
+		table.insert(diagnostics, _object)
+	end
+	return {
+		diagnostics = diagnostics,
+	}
+end
+-- Registering does not re-run analysis, only deregistering does (docs, and seen live: a new
+-- diagnostic stayed hidden until the next edit). A throwaway callback forces the re-run.
+local function refreshAnalysis()
+	if analysisRegistered then
+		ScriptEditorService:DeregisterScriptAnalysisCallback(ANALYSIS_CALLBACK)
+	end
+	analysisRegistered = false
+	-- ▼ ReadonlyMap.size ▼
+	local _size = 0
+	for _ in diagnosticsByScript do
+		_size += 1
+	end
+	-- ▲ ReadonlyMap.size ▲
+	if _size == 0 then
+		return nil
+	end
+	ScriptEditorService:RegisterScriptAnalysisCallback(ANALYSIS_CALLBACK, 100, analysisCallback)
+	analysisRegistered = true
+	ScriptEditorService:RegisterScriptAnalysisCallback(REFRESH_CALLBACK, 101, function()
+		return {
+			diagnostics = {},
+		}
+	end)
+	ScriptEditorService:DeregisterScriptAnalysisCallback(REFRESH_CALLBACK)
+end
+local function setDiagnostics(requestData)
+	local action = requestData.action
+	if action == "clear" then
+		local _path = requestData.path
+		if type(_path) == "string" then
+			local target, err = resolveScript(requestData)
+			if not target then
+				return {
+					error = err,
+				}
+			end
+			diagnosticsByScript[target] = nil
+		else
+			table.clear(diagnosticsByScript)
+		end
+		refreshAnalysis()
+		local _object = {
+			success = true,
+		}
+		local _left = "scriptsWithDiagnostics"
+		-- ▼ ReadonlyMap.size ▼
+		local _size = 0
+		for _ in diagnosticsByScript do
+			_size += 1
+		end
+		-- ▲ ReadonlyMap.size ▲
+		_object[_left] = _size
+		return _object
+	end
+	if action == "list" then
+		local scripts = {}
+		for target, entries in diagnosticsByScript do
+			scripts[getInstancePath(target)] = entries
+		end
+		return {
+			scripts = scripts,
+		}
+	end
+	local target, err = resolveScript(requestData)
+	if not target then
+		return {
+			error = err,
+		}
+	end
+	local raw = requestData.diagnostics
+	if not (type(raw) == "table") then
+		return {
+			error = "diagnostics must be an array",
+		}
+	end
+	local entries = {}
+	for _, entry in raw do
+		local _line = entry.line
+		local _condition = not (type(_line) == "number")
+		if not _condition then
+			local _message = entry.message
+			_condition = not (type(_message) == "string")
+		end
+		if _condition then
+			return {
+				error = "each diagnostic needs line and message",
+			}
+		end
+		local _condition_1 = entry.severity ~= nil
+		if _condition_1 then
+			local _severity = entry.severity
+			_condition_1 = not (table.find(SEVERITIES, _severity) ~= nil)
+		end
+		if _condition_1 then
+			return {
+				error = `severity must be one of {table.concat(SEVERITIES, ", ")}`,
+			}
+		end
+		table.insert(entries, entry)
+	end
+	if #entries == 0 then
+		diagnosticsByScript[target] = nil
+	else
+		diagnosticsByScript[target] = entries
+	end
+	refreshAnalysis()
+	return {
+		success = true,
+		path = getInstancePath(target),
+		count = #entries,
+	}
+end
+local function scriptEditor(requestData)
+	local action = requestData.action
+	if action == "documents" then
+		return listDocuments()
+	end
+	if action == "read" then
+		return readEditorSource(requestData)
+	end
+	if action == "open" then
+		local target, err = resolveScript(requestData)
+		if not target then
+			return {
+				error = err,
+			}
+		end
+		local openError = openDocument(target, requestData)
+		return if openError ~= "" and openError then {
+			error = openError,
+		} else {
+			success = true,
+		}
+	end
+	if action == "edit" then
+		return editDocument(requestData)
+	end
+	if action == "diagnostics_set" or action == "clear" or action == "list" then
+		local _object = table.clone(requestData)
+		setmetatable(_object, nil)
+		_object.action = if action == "diagnostics_set" then "set" else action
+		return setDiagnostics(_object)
+	end
+	return {
+		error = `Unknown action: {action}`,
+	}
+end
+-- The service only exists in a Team Create session; unpublished or solo places have none.
+local function collaborators()
+	local people = {}
+	local service = game:FindService("CollaboratorsService")
+	if not service then
+		return people
+	end
+	for _, child in service:GetChildren() do
+		if not child:IsA("Collaborator") then
+			continue
+		end
+		local collaborator = child
+		local _arg0 = {
+			username = collaborator.Username,
+			userId = collaborator.UserId,
+			idle = collaborator.IsIdle,
+			status = tostring(collaborator.Status),
+			documentGuid = collaborator.CurDocGUID,
+			line = collaborator.CurScriptLineNumber,
+		}
+		table.insert(people, _arg0)
+	end
+	return people
+end
+local function studioActivity(requestData)
+	local _since = requestData.since
+	local since = if type(_since) == "number" then requestData.since else 0
+	-- ▼ ReadonlyArray.filter ▼
+	local _newValue = {}
+	local _callback = function(entry)
+		return entry.at >= since
+	end
+	local _length = 0
+	for _k, _v in history do
+		if _callback(_v, _k - 1, history) == true then
+			_length += 1
+			_newValue[_length] = _v
+		end
+	end
+	-- ▲ ReadonlyArray.filter ▲
+	local events = _newValue
+	local ok, people = pcall(collaborators)
+	return {
+		now = os.time(),
+		teamCreate = game:FindService("CollaboratorsService") ~= nil,
+		collaborators = if ok then people else {},
+		collaboratorsError = if ok then nil else tostring(people),
+		events = events,
+	}
+end
+local connections = {}
+local function init()
+	if RunService:IsRunning() then
+		return nil
+	end
+	local _arg0 = ChangeHistoryService.OnUndo:Connect(function(waypoint)
+		return record("undo", waypoint)
+	end)
+	table.insert(connections, _arg0)
+	local _arg0_1 = ChangeHistoryService.OnRedo:Connect(function(waypoint)
+		return record("redo", waypoint)
+	end)
+	table.insert(connections, _arg0_1)
+	local recordings = ChangeHistoryService
+	local _arg0_2 = recordings.OnRecordingFinished:Connect(function(name, displayName)
+		local _condition = displayName
+		if _condition == nil then
+			_condition = name
+		end
+		return record("change", _condition)
+	end)
+	table.insert(connections, _arg0_2)
+	local _arg0_3 = ScriptEditorService.TextDocumentDidOpen:Connect(function(document)
+		return record("open", "", documentPath(document))
+	end)
+	table.insert(connections, _arg0_3)
+	local _arg0_4 = ScriptEditorService.TextDocumentDidClose:Connect(function(document)
+		return record("close", "", documentPath(document))
+	end)
+	table.insert(connections, _arg0_4)
+	-- Fires per keystroke, so a burst of typing in one target folds into a single entry.
+	local _arg0_5 = ScriptEditorService.TextDocumentDidChange:Connect(function(document, changes)
+		if document:IsCommandBar() then
+			return nil
+		end
+		local path = documentPath(document)
+		local _firstLine = changes[1]
+		if _firstLine ~= nil then
+			_firstLine = _firstLine.range.start.line
+		end
+		local firstLine = _firstLine
+		local last = history[#history]
+		if last and last.kind == "edit" and last.script == path and os.time() - last.at <= EDIT_BURST_SECONDS then
+			last.at = os.time()
+			local _condition = last.count
+			if _condition == nil then
+				_condition = 1
+			end
+			last.count = _condition + 1
+			last.detail = `near line {firstLine}`
+			return nil
+		end
+		record("edit", `near line {firstLine}`, path)
+	end)
+	table.insert(connections, _arg0_5)
+end
+-- Called by a hot reload before the new copy of this module takes over, so the old copy
+-- stops recording and its Script Analysis callback name is free to register again.
+local function shutdown()
+	for _, connection in connections do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	if analysisRegistered then
+		ScriptEditorService:DeregisterScriptAnalysisCallback(ANALYSIS_CALLBACK)
+	end
+	analysisRegistered = false
+end
+return {
+	scriptEditor = scriptEditor,
+	studioActivity = studioActivity,
+	init = init,
+	shutdown = shutdown,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="11">
+          <Properties>
             <string name="Name">EvalRuntimeHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
 local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
@@ -2586,7 +3413,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">GenerateModelHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2791,7 +3618,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="13">
           <Properties>
             <string name="Name">InputHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -2945,7 +3772,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">InstanceHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3452,7 +4279,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="15">
           <Properties>
             <string name="Name">LogHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3478,7 +4305,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="14">
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">MemoryHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -3546,7 +4373,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="15">
+        <Item class="ModuleScript" referent="17">
           <Properties>
             <string name="Name">MetadataHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -4129,7 +4956,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="16">
+        <Item class="ModuleScript" referent="18">
           <Properties>
             <string name="Name">MicroProfilerHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -5882,7 +6709,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="17">
+        <Item class="ModuleScript" referent="19">
           <Properties>
             <string name="Name">MultiplayerTestHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6147,7 +6974,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="18">
+        <Item class="ModuleScript" referent="20">
           <Properties>
             <string name="Name">PropertyHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -6399,7 +7226,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="19">
+        <Item class="ModuleScript" referent="21">
           <Properties>
             <string name="Name">QueryHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -7415,7 +8242,194 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="20">
+        <Item class="ModuleScript" referent="22">
+          <Properties>
+            <string name="Name">ReloadHandlers</string>
+            <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
+local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
+-- Hot reload: swap in newly built handler code without reopening the place.
+--
+-- Studio only rereads a plugin's .rbxmx when the place opens, so a rebuilt MCP plugin used to
+-- need a reopen to take effect. Instead the MCP server sends the freshly compiled modules and
+-- this rebuilds them as real ModuleScripts. roblox-ts wires modules together with TS.import,
+-- which walks script.Parent, so the new tree mirrors the plugin's own layout: a `modules`
+-- folder with the new code beside copies of the unchanged `include` (RuntimeLib) and
+-- `node_modules`. The live poll loop then routes requests to the new handlers.
+--
+-- What this cannot reload: the poll loop, UI and this file, which were running before the
+-- reload and keep running. Changes to those still need a place reopen.
+local EditorHandlers = TS.import(script, script.Parent, "EditorHandlers")
+local RunService = game:GetService("RunService")
+local pluginRef
+local generation = 0
+local liveRoot
+-- The EditorHandlers copy currently wired in, so the next reload can release it. Starts as the
+-- copy the plugin booted with.
+local liveEditor = EditorHandlers
+local function init(p)
+	pluginRef = p
+end
+-- This file sits at <root>/modules/handlers/ReloadHandlers, so the plugin root is 3 up.
+local function pluginRoot()
+	local _result = script.Parent
+	if _result ~= nil then
+		_result = _result.Parent
+		if _result ~= nil then
+			_result = _result.Parent
+		end
+	end
+	return _result
+end
+local function placeModule(root, path, source)
+	local parts = string.split(path, "/")
+	local parent = root
+	for i = 0, #parts - 2 do
+		local folder = parent:FindFirstChild(parts[i + 1])
+		if not folder then
+			folder = Instance.new("Folder")
+			folder.Name = parts[i + 1]
+			folder.Parent = parent
+		end
+		parent = folder
+	end
+	local module = Instance.new("ModuleScript")
+	module.Name = parts[#parts]
+	module.Source = source
+	module.Parent = parent
+end
+local function reloadPlugin(requestData, setRouteOverride)
+	if RunService:IsRunning() then
+		return {
+			error = "Reload only runs in edit mode; stop the playtest first.",
+		}
+	end
+	local files = requestData.files
+	if not (type(files) == "table") then
+		return {
+			error = "files is required (map of module path to compiled source)",
+		}
+	end
+	local source = pluginRoot()
+	if not source then
+		return {
+			error = "Could not locate the plugin root to copy include and node_modules from",
+		}
+	end
+	local root = Instance.new("Folder")
+	root.Name = `MCPReload_{generation + 1}`
+	for _, name in { "include", "node_modules" } do
+		local original = source:FindFirstChild(name)
+		if not original then
+			root:Destroy()
+			return {
+				error = `Plugin root has no {name} to copy`,
+			}
+		end
+		original:Clone().Parent = root
+	end
+	local moduleCount = 0
+	for path, text in pairs(files) do
+		if not (type(path) == "string") or not (type(text) == "string") then
+			continue
+		end
+		placeModule(root, path, text)
+		moduleCount += 1
+	end
+	local _communicationModule = root:FindFirstChild("modules")
+	if _communicationModule ~= nil then
+		_communicationModule = _communicationModule:FindFirstChild("Communication")
+	end
+	local communicationModule = _communicationModule
+	if not communicationModule or not communicationModule:IsA("ModuleScript") then
+		root:Destroy()
+		return {
+			error = "The sent files have no modules/Communication",
+		}
+	end
+	local ok, fresh = pcall(function()
+		return require(communicationModule)
+	end)
+	local _condition = not ok or not (type(fresh) == "table")
+	if not _condition then
+		local _routes = fresh.routes
+		_condition = not (type(_routes) == "table")
+	end
+	if _condition then
+		root:Destroy()
+		return {
+			error = `New code failed to load, kept the running version: {tostring(fresh)}`,
+		}
+	end
+	local _handlers = root:FindFirstChild("modules")
+	if _handlers ~= nil then
+		_handlers = _handlers:FindFirstChild("handlers")
+	end
+	local handlers = _handlers
+	local _editorModule = handlers
+	if _editorModule ~= nil then
+		_editorModule = _editorModule:FindFirstChild("EditorHandlers")
+	end
+	local editorModule = _editorModule
+	local _breakpointModule = handlers
+	if _breakpointModule ~= nil then
+		_breakpointModule = _breakpointModule:FindFirstChild("BreakpointHandlers")
+	end
+	local breakpointModule = _breakpointModule
+	local _result = editorModule
+	if _result ~= nil then
+		_result = _result:IsA("ModuleScript")
+	end
+	local freshEditor = if _result then (require(editorModule)) else nil
+	local _result_1 = breakpointModule
+	if _result_1 ~= nil then
+		_result_1 = _result_1:IsA("ModuleScript")
+	end
+	local freshBreakpoints = if _result_1 then (require(breakpointModule)) else nil
+	-- Release the previous copy's listeners before the new one registers the same names.
+	local _result_2 = liveEditor
+	if _result_2 ~= nil then
+		_result_2 = _result_2.shutdown
+		if _result_2 ~= nil then
+			_result_2()
+		end
+	end
+	local _result_3 = freshEditor
+	if _result_3 ~= nil then
+		_result_3 = _result_3.init
+		if _result_3 ~= nil then
+			_result_3()
+		end
+	end
+	local _result_4 = freshBreakpoints
+	if _result_4 ~= nil then
+		_result_4 = _result_4.init
+		if _result_4 ~= nil then
+			_result_4(pluginRef)
+		end
+	end
+	setRouteOverride(fresh.routes)
+	local _result_5 = liveRoot
+	if _result_5 ~= nil then
+		_result_5:Destroy()
+	end
+	liveRoot = root
+	liveEditor = freshEditor
+	generation += 1
+	return {
+		success = true,
+		generation = generation,
+		modules = moduleCount,
+		message = `Reloaded {moduleCount} modules (generation {generation}). Poll loop, UI and reload code keep the version that was open.`,
+	}
+end
+return {
+	init = init,
+	reloadPlugin = reloadPlugin,
+}
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="23">
           <Properties>
             <string name="Name">SceneAnalysisHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -7664,7 +8678,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="21">
+        <Item class="ModuleScript" referent="24">
           <Properties>
             <string name="Name">ScriptHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -8360,7 +9374,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="22">
+        <Item class="ModuleScript" referent="25">
           <Properties>
             <string name="Name">ScriptProfilerHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -8823,7 +9837,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="23">
+        <Item class="ModuleScript" referent="26">
           <Properties>
             <string name="Name">SelectionHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -9009,7 +10023,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="24">
+        <Item class="ModuleScript" referent="27">
           <Properties>
             <string name="Name">SerializationHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -9195,7 +10209,7 @@ return {
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="25">
+        <Item class="ModuleScript" referent="28">
           <Properties>
             <string name="Name">TestHandlers</string>
             <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -9203,12 +10217,14 @@ local TS = require(script.Parent.Parent.Parent.include.RuntimeLib)
 local _services = TS.import(script, script.Parent.Parent.Parent, "node_modules", "@rbxts", "services")
 local HttpService = _services.HttpService
 local LogService = _services.LogService
+local RunService = _services.RunService
 local StudioTestService = game:GetService("StudioTestService")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local STOP_SIGNAL = "__MCP_STOP__"
 local NAV_SIGNAL = "__MCP_NAV__"
 local NAV_RESULT = "__MCP_NAV_RESULT__"
+local STOP_CONFIRM_SECONDS = 5
 local testRunning = false
 local outputBuffer = {}
 local logConnection
@@ -9388,35 +10404,75 @@ local function startPlaytest(requestData)
 		message = msg,
 	}
 end
-local function stopPlaytest(_requestData)
-	if testRunning then
-		warn(STOP_SIGNAL)
-		local _object = {
-			success = true,
-		}
-		local _left = "output"
-		local _array = {}
-		local _length = #_array
-		table.move(outputBuffer, 1, #outputBuffer, _length + 1, _array)
-		_object[_left] = _array
-		_object.outputCount = #outputBuffer
-		_object.message = "Playtest stop signal sent."
-		return _object
+-- testRunning flips false only when ExecuteRunModeAsync/ExecutePlayModeAsync returns, so it is
+-- the one trustworthy "the test really ended" signal the edit peer has.
+local function waitForTestEnd(timeoutSeconds)
+	local deadline = os.clock() + timeoutSeconds
+	while testRunning and os.clock() < deadline do
+		task.wait(0.2)
 	end
-	local endTest = StudioTestService
-	local endOk = pcall(function()
-		endTest:EndTest("stopped_by_mcp")
+	return not testRunning
+end
+-- Runs in the play SERVER copy of the plugin: EndTest only works from that DataModel
+-- (StudioTestService docs; calling it from edit errors). The MCP server reaches this copy
+-- directly over the bridge, the same way eval_server_runtime does.
+local function endTest(_requestData)
+	if not RunService:IsRunning() or not RunService:IsServer() then
+		return {
+			error = "end-test must be sent to the play server peer",
+		}
+	end
+	local service = StudioTestService
+	local ok, err = pcall(function()
+		return service:EndTest("stopped_by_mcp")
 	end)
-	if endOk then
+	return if ok then {
+		success = true,
+	} else {
+		error = `EndTest failed: {tostring(err)}`,
+	}
+end
+-- Runs in the edit copy after the MCP server has asked the play server to end the test.
+-- testRunning flips false only when ExecuteRunModeAsync/ExecutePlayModeAsync returns, so it
+-- is the edit side's one trustworthy "the test really ended" signal.
+local function stopPlaytest(requestData)
+	local endRequested = requestData.endRequested == true
+	local _array = {}
+	local _length = #_array
+	table.move(outputBuffer, 1, #outputBuffer, _length + 1, _array)
+	local output = _array
+	if not testRunning then
+		-- The play server usually finishes EndTest before this runs, so "not running" after an
+		-- accepted end request means it stopped, whoever started it.
+		return if endRequested then {
+			success = true,
+			stopped = true,
+			output = output,
+			outputCount = #output,
+			message = "Playtest stopped.",
+		} else {
+			success = false,
+			stopped = false,
+			output = output,
+			outputCount = #output,
+			error = "No playtest server answered, and none was started by the MCP. Nothing to stop, or press Stop in Studio.",
+		}
+	end
+	if waitForTestEnd(STOP_CONFIRM_SECONDS) then
 		return {
 			success = true,
-			output = {},
-			outputCount = 0,
-			message = "Playtest stopped via StudioTestService.",
+			stopped = true,
+			output = output,
+			outputCount = #output,
+			message = "Playtest stopped.",
 		}
 	end
 	return {
-		error = "No MCP-started test is running and direct stop failed. The playtest may have been started manually.",
+		success = false,
+		stopped = false,
+		output = output,
+		outputCount = #output,
+		error = if endRequested then "The play server accepted the stop but the test has not ended yet. Press Stop in Studio if it stays up." else "The play server did not answer the stop. It is likely paused at a breakpoint or hung. Press Stop in Studio.",
 	}
 end
 local function getPlaytestOutput(_requestData)
@@ -9503,6 +10559,7 @@ end
 return {
 	startPlaytest = startPlaytest,
 	stopPlaytest = stopPlaytest,
+	endTest = endTest,
 	getPlaytestOutput = getPlaytestOutput,
 	characterNavigation = characterNavigation,
 }
@@ -9510,7 +10567,7 @@ return {
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="26">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">LuauExec</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -9944,7 +11001,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="27">
+      <Item class="ModuleScript" referent="30">
         <Properties>
           <string name="Name">Recording</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -9974,7 +11031,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="28">
+      <Item class="ModuleScript" referent="31">
         <Properties>
           <string name="Name">RuntimeLogBuffer</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -10229,7 +11286,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="29">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">State</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -10325,7 +11382,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="30">
+      <Item class="ModuleScript" referent="33">
         <Properties>
           <string name="Name">StopPlayMonitor</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -10623,7 +11680,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="34">
         <Properties>
           <string name="Name">UI</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -11343,7 +12400,7 @@ return {
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="32">
+      <Item class="ModuleScript" referent="35">
         <Properties>
           <string name="Name">Utils</string>
           <string name="Source"><![CDATA[-- Compiled with roblox-ts v3.0.0
@@ -11880,11 +12937,11 @@ return {
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="36">
+    <Item class="Folder" referent="39">
       <Properties>
         <string name="Name">include</string>
       </Properties>
-      <Item class="ModuleScript" referent="33">
+      <Item class="ModuleScript" referent="36">
         <Properties>
           <string name="Name">Promise</string>
           <string name="Source"><![CDATA[--[[
@@ -13958,7 +15015,7 @@ return Promise
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="34">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">RuntimeLib</string>
           <string name="Source"><![CDATA[local Promise = require(script.Parent.Promise)
@@ -14225,15 +15282,15 @@ return TS
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="37">
+    <Item class="Folder" referent="40">
       <Properties>
         <string name="Name">node_modules</string>
       </Properties>
-      <Item class="Folder" referent="38">
+      <Item class="Folder" referent="41">
         <Properties>
           <string name="Name">@rbxts</string>
         </Properties>
-      <Item class="ModuleScript" referent="35">
+      <Item class="ModuleScript" referent="38">
         <Properties>
           <string name="Name">services</string>
           <string name="Source"><![CDATA[return setmetatable({}, {

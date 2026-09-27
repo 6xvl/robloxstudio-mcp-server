@@ -51,3 +51,35 @@ describe('ProxyBridgeService instance polling', () => {
     kept.dispose();
   });
 });
+
+describe('ambiguous target guard on the proxy transport', () => {
+  /**
+   * The base class guard is bypassed entirely by ProxyBridgeService, which overrides
+   * sendRequest. A second MCP client always becomes a proxy, so that is the normal
+   * path, not the rare one -- and it is the path that answered from the wrong place
+   * twice before this existed.
+   */
+  it('refuses before forwarding when two Studios share a role', async () => {
+    const proxy = new ProxyBridgeService('http://localhost:1');
+    (proxy as any).cachedInstances = [
+      { instanceId: 'aaa', role: 'edit', lastActivity: 0, connectedAt: 0 },
+      { instanceId: 'bbb', role: 'edit', lastActivity: 0, connectedAt: 0 },
+    ];
+    await expect(proxy.sendRequest('/test', {}, 'edit')).rejects.toThrow(
+      /2 Studios are connected as "edit" and none is selected/
+    );
+  });
+
+  it('lets a pinned request through to the transport', async () => {
+    const proxy = new ProxyBridgeService('http://localhost:1');
+    (proxy as any).cachedInstances = [
+      { instanceId: 'aaa', role: 'edit', lastActivity: 0, connectedAt: 0 },
+      { instanceId: 'bbb', role: 'edit', lastActivity: 0, connectedAt: 0 },
+    ];
+    proxy.setPreferredInstance('aaa');
+    // Reaches fetch and fails on the dead port -- which proves the guard did not stop it.
+    await expect(proxy.sendRequest('/test', {}, 'edit')).rejects.not.toThrow(
+      /none is selected/
+    );
+  });
+});

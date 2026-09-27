@@ -4,6 +4,8 @@ import UI from "../modules/UI";
 import Communication from "../modules/Communication";
 import RuntimeLogBuffer from "../modules/RuntimeLogBuffer";
 import BreakpointHandlers from "../modules/handlers/BreakpointHandlers";
+import EditorHandlers from "../modules/handlers/EditorHandlers";
+import ReloadHandlers from "../modules/handlers/ReloadHandlers";
 import { cleanupLegacyEditBridges, ensureRuntimeBridgeInstalled } from "../modules/EvalBridges";
 
 // Attach the per-peer LogService listener before anything else, so boot-time prints from
@@ -12,6 +14,8 @@ RuntimeLogBuffer.install();
 
 // Breakpoints are stored through plugin:SetSetting, so the module needs the handle.
 BreakpointHandlers.init(plugin);
+EditorHandlers.init();
+ReloadHandlers.init(plugin);
 
 UI.init(plugin);
 const elements = UI.getElements();
@@ -21,7 +25,8 @@ const elements = UI.getElements();
 // play server, and one per play client. Everything below that says "peer" means one of
 // those, and the MCP bridge addresses them by exactly this name.
 function peerRole(): "edit" | "server" | "client" {
-	if (!RunService.IsRunMode()) return "edit";
+	// IsRunMode is true only for a Run playtest, so Play-mode peers used to report as edit.
+	if (!RunService.IsRunning()) return "edit";
 	if (RunService.IsServer()) return "server";
 	return "client";
 }

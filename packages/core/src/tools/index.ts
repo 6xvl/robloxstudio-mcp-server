@@ -1,4 +1,5 @@
 import { StudioHttpClient } from './studio-client.js';
+import { findPluginOutDir, readPluginModules } from '../plugin-reload.js';
 import { BridgeService } from '../bridge-service.js';
 import { runBuildExecutor, computeBoundsFromParts } from './build-executor.js';
 import { OpenCloudClient } from '../opencloud-client.js';
@@ -22,6 +23,10 @@ import {
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import * as crypto from 'crypto';
+import { ProcessRunner } from '../managers/process-runner.js';
+import { PathFinder } from '../managers/path-finder.js';
+import { mapEntries, buildSourcemap, MANIFEST_NAME, SOURCEMAP_NAME, type Manifest } from '../source-sync.js';
 
 type RawImageCaptureResponse = {
   success?: boolean;
@@ -658,6 +663,371 @@ export class RobloxStudioTools {
     };
   }
 
+  // ============ source sync: the place's scripts as files ============
+  // See source-sync.ts for the layout and for what this deliberately does NOT do.
+
+  /**
+   * Run Luau that returns a JSON string, and parse it.
+   *
+   * A string rather than a table: the bridge already hands `returnValue` back through
+   * JSON, so a returned table would be double-encoded and a parse failure would look
+   * like a data problem rather than a protocol one.
+   */
+  private async luauJson<T>(code: string, target = 'edit'): Promise<T> {
+    const res = await this.client.request('/api/execute-luau', { code }, target) as
+      { returnValue?: unknown; error?: string };
+    if (res?.error) throw new Error(`execute-luau failed: ${res.error}`);
+    const raw = res?.returnValue;
+    if (typeof raw !== 'string') {
+      throw new Error(`execute-luau returned ${typeof raw}, expected a JSON string`);
+    }
+    return JSON.parse(raw) as T;
+  }
+
+  /**
+   * The walker the count and the fetch share.
+   *
+   * ONE ORDERING, USED TWICE. Scripts are addressed by their index in this walk and
+   * not by path, because an instance name may contain a dot and resolving
+   * "game.a.b.c" back to an instance is then ambiguous. GetDescendants order is stable
+   * while the tree is not being edited, which every paged read here already assumes.
+   */
+  private static syncWalker(roots: string[], exclude: string[], from: number, to: number, withSource: boolean): string {
+    const rootsLua = roots.map(r => JSON.stringify(r)).join(', ');
+    /**
+     * Excludes are normalised to carry the `game.` prefix, because the Luau side adds
+     * it and Instance:GetFullName() does NOT. Measured: excluding
+     * "game.ServerStorage.BonBackup_2026_09_23" matched nothing and the walk returned
+     * all 341 scripts instead of 95, because GetFullName answers
+     * "ServerStorage.BonBackup_2026_09_23.…". Silently excluding nothing is the worst
+     * shape of that bug -- the pull looks like it worked.
+     */
+    const exclLua = exclude
+      .map(r => (r.startsWith('game.') ? r : `game.${r}`))
+      .map(r => JSON.stringify(r)).join(', ');
+    const emit = withSource
+      ? '            out[#out + 1] = { p = full, c = d.ClassName, s = d.Source }'
+      : '            out[#out + 1] = { p = full, c = d.ClassName }';
+    return [
+      'local HttpService = game:GetService("HttpService")',
+      'local roots = { ' + rootsLua + ' }',
+      'local excl = { ' + exclLua + ' }',
+      'local from, to = ' + from + ', ' + to,
+      'local out, i = {}, 0',
+      'for _, rootName in ipairs(roots) do',
+      '  local root = game:FindFirstChild(rootName)',
+      '  if root then',
+      '    for _, d in ipairs(root:GetDescendants()) do',
+      '      if d:IsA("LuaSourceContainer") then',
+      '        local full = "game." .. d:GetFullName()',
+      '        local skip = false',
+      '        for _, e in ipairs(excl) do',
+      '          if string.sub(full, 1, string.len(e)) == e then skip = true break end',
+      '        end',
+      '        if not skip then',
+      '          i = i + 1',
+      '          if i >= from and i <= to then',
+      emit,
+      '          end',
+      '        end',
+      '      end',
+      '    end',
+      '  end',
+      'end',
+      'return HttpService:JSONEncode({ total = i, items = out })',
+    ].join('\n');
+  }
+
+  private static readonly SYNC_DEFAULT_ROOTS = [
+    'ReplicatedStorage', 'ServerScriptService', 'StarterPlayer', 'StarterGui',
+    'ServerStorage', 'Workspace', 'ReplicatedFirst', 'Lighting', 'SoundService',
+  ];
+
+  async sourcePull(outDir: string, opts: {
+    roots?: string[]; exclude?: string[]; batchSize?: number; dryRun?: boolean;
+  } = {}) {
+    if (!outDir) throw new Error('out_dir is required for source_pull');
+    const roots = opts.roots && opts.roots.length ? opts.roots : RobloxStudioTools.SYNC_DEFAULT_ROOTS;
+    const exclude = opts.exclude ?? [];
+    const batch = Math.max(1, Math.min(opts.batchSize ?? 25, 200));
+
+    const head = await this.luauJson<{ total: number }>(
+      RobloxStudioTools.syncWalker(roots, exclude, 1, 0, false));
+    const total = head.total;
+
+    const entries: Array<{ instancePath: string; className: string; source: string }> = [];
+    for (let from = 1; from <= total; from += batch) {
+      const to = Math.min(from + batch - 1, total);
+      const page = await this.luauJson<{ items: Array<{ p: string; c: string; s: string }> }>(
+        RobloxStudioTools.syncWalker(roots, exclude, from, to, true));
+      for (const it of page.items) {
+        entries.push({ instancePath: it.p, className: it.c, source: it.s ?? '' });
+      }
+    }
+
+    const mapped = mapEntries(entries);
+    if (opts.dryRun) {
+      return { content: [{ type: 'text', text: JSON.stringify({
+        dryRun: true, total, wouldWrite: mapped.length,
+        sample: mapped.slice(0, 10).map(m => m.relPath),
+      }) }] };
+    }
+
+    const manifest: Manifest = { version: 1, pulledAt: new Date().toISOString(), files: {} };
+    let written = 0;
+    fs.mkdirSync(outDir, { recursive: true });
+    for (const m of mapped) {
+      const abs = path.join(outDir, m.relPath);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, m.source, 'utf8');
+      manifest.files[m.relPath] = {
+        instancePath: m.instancePath,
+        className: m.className,
+        sha1: crypto.createHash('sha1').update(m.source, 'utf8').digest('hex'),
+      };
+      written++;
+    }
+    fs.writeFileSync(path.join(outDir, MANIFEST_NAME), JSON.stringify(manifest, null, 2), 'utf8');
+
+    // Rewritten every pull: a stale sourcemap silently mis-resolves requires, which is
+    // worse than none because the checker then reports confident nonsense.
+    const sourcemap = buildSourcemap(mapped.map(m => ({
+      relPath: m.relPath, instancePath: m.instancePath, className: m.className,
+    })));
+    fs.writeFileSync(path.join(outDir, SOURCEMAP_NAME), JSON.stringify(sourcemap, null, 2), 'utf8');
+
+    return { content: [{ type: 'text', text: JSON.stringify({
+      success: true, outDir, scripts: written, roots, exclude,
+      manifest: MANIFEST_NAME, sourcemap: SOURCEMAP_NAME,
+    }) }] };
+  }
+
+  async sourcePush(inDir: string, opts: { dryRun?: boolean; only?: string[] } = {}) {
+    if (!inDir) throw new Error('in_dir is required for source_push');
+    const manifestPath = path.join(inDir, MANIFEST_NAME);
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error(manifestPath + ' not found. A push only writes scripts a pull recorded, so run source_pull first.');
+    }
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Manifest;
+
+    const changed: Array<{ relPath: string; instancePath: string; source: string }> = [];
+    const missing: string[] = [];
+    for (const [rel, rec] of Object.entries(manifest.files)) {
+      if (opts.only && opts.only.length && !opts.only.some(o => rel.startsWith(o))) continue;
+      const abs = path.join(inDir, rel);
+      if (!fs.existsSync(abs)) { missing.push(rel); continue; }
+      const source = fs.readFileSync(abs, 'utf8');
+      const sha1 = crypto.createHash('sha1').update(source, 'utf8').digest('hex');
+      if (sha1 !== rec.sha1) changed.push({ relPath: rel, instancePath: rec.instancePath, source });
+    }
+
+    if (opts.dryRun) {
+      return { content: [{ type: 'text', text: JSON.stringify({
+        dryRun: true, changed: changed.map(c => c.relPath), missing,
+      }) }] };
+    }
+
+    const applied: string[] = [];
+    const failed: Array<{ relPath: string; error: string }> = [];
+    for (const c of changed) {
+      try {
+        await this.client.request('/api/set-script-source', { instancePath: c.instancePath, source: c.source });
+        applied.push(c.relPath);
+        manifest.files[c.relPath].sha1 = crypto.createHash('sha1').update(c.source, 'utf8').digest('hex');
+      } catch (err) {
+        failed.push({ relPath: c.relPath, error: (err as Error).message });
+      }
+    }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+
+    return { content: [{ type: 'text', text: JSON.stringify({
+      success: failed.length === 0,
+      applied: applied.length, appliedFiles: applied, failed, missing,
+      note: missing.length
+        ? 'Manifest entries with no file on disk were skipped; a push never deletes an instance.'
+        : undefined,
+    }) }] };
+  }
+
+
+  /**
+   * A pull, committed. The history the place file cannot keep.
+   *
+   * Git rather than a bespoke snapshot format because the point is diffs, blame and
+   * revert, and those are solved. The repository is created on first use so this is
+   * one call rather than a setup ritual.
+   */
+  async sourceSnapshot(dir: string, opts: { message?: string; roots?: string[]; exclude?: string[] } = {}) {
+    if (!dir) throw new Error('dir is required for source_snapshot');
+
+    const git = await ProcessRunner.run('git', ['--version']);
+    if (git.code !== 0) throw new Error('git is not on PATH, so a snapshot cannot be committed.');
+
+    fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(path.join(dir, '.git'))) {
+      const init = await ProcessRunner.run('git', ['init', '-q'], dir);
+      if (init.code !== 0) throw new Error(`git init failed: ${init.stderr || init.stdout}`);
+    }
+
+    await this.sourcePull(dir, { roots: opts.roots, exclude: opts.exclude });
+
+    await ProcessRunner.run('git', ['add', '-A'], dir);
+    const status = await ProcessRunner.run('git', ['status', '--porcelain'], dir);
+    if (!status.stdout.trim()) {
+      const head = await ProcessRunner.run('git', ['rev-parse', '--short', 'HEAD'], dir);
+      return { content: [{ type: 'text', text: JSON.stringify({
+        success: true, committed: false,
+        reason: 'nothing changed since the last snapshot',
+        head: head.stdout.trim() || null,
+      }) }] };
+    }
+
+    const message = opts.message || `snapshot ${new Date().toISOString()}`;
+    const commit = await ProcessRunner.run('git', ['commit', '-q', '-m', message], dir);
+    if (commit.code !== 0) {
+      throw new Error(`git commit failed: ${commit.stderr || commit.stdout}`);
+    }
+    const head = await ProcessRunner.run('git', ['rev-parse', '--short', 'HEAD'], dir);
+    const stat = await ProcessRunner.run('git', ['show', '--stat', '--oneline', 'HEAD'], dir);
+
+    return { content: [{ type: 'text', text: JSON.stringify({
+      success: true, committed: true, dir,
+      commit: head.stdout.trim(),
+      summary: stat.stdout.trim().split('\n').slice(-1)[0] || '',
+    }) }] };
+  }
+
+  /**
+   * Type-check or lint a pulled tree.
+   *
+   * THE ONE THING THE BRIDGE CAN NEVER DO. A place file has no type checker, and a
+   * clean parse is not verification: an undeclared global resolves to nil and ships.
+   * Every `--!strict` in the codebase is decorative until something reads it, and this
+   * is the something.
+   *
+   * The binary is searched for rather than assumed, because it arrives by aftman,
+   * rokit, cargo or hand and none of those agree on a location.
+   */
+  private static findTool(name: string): string | null {
+    const exe = process.platform === 'win32' ? `${name}.exe` : name;
+    const candidates = [
+      path.join(os.homedir(), '.aftman', 'bin', exe),
+      path.join(os.homedir(), '.rokit', 'bin', exe),
+      path.join(os.homedir(), '.cargo', 'bin', exe),
+      path.join(os.homedir(), '.foreman', 'bin', exe),
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    return null;
+  }
+
+  /**
+   * Where the Roblox API type definitions live.
+   *
+   * WITHOUT THEM THE CHECKER IS NOISE. Measured on a seven file tree: bare, it
+   * reported "Unknown global 'game'", "Unknown global 'script'" and "Unknown type
+   * 'Player'" -- every Roblox name in the codebase is an error, so real findings are
+   * buried and nobody reads the output twice. With them, those vanish and what is left
+   * is true: a string assigned to a number, and an Instance? that could be nil.
+   *
+   * Bundled with the package so this works on a fresh clone. An explicit path wins, a
+   * copy sitting in the tree being checked comes next, so a project can pin its own.
+   */
+  private static findLuauDefinitions(dir: string, explicit?: string): string | null {
+    if (explicit) return fs.existsSync(explicit) ? explicit : null;
+    const inTree = path.join(dir, 'globalTypes.d.luau');
+    if (fs.existsSync(inTree)) return inTree;
+    if (process.env.ROBLOX_LUAU_DEFINITIONS && fs.existsSync(process.env.ROBLOX_LUAU_DEFINITIONS)) {
+      return process.env.ROBLOX_LUAU_DEFINITIONS;
+    }
+    // Through PathFinder, which is the one walk-up search. Two hand-rolled copies of
+    // this already disagreed about depth and module system, and one of them typechecked,
+    // built and returned null at runtime.
+    return PathFinder.find({
+      shapes: [
+        ['assets', 'globalTypes.d.luau'],
+        ['packages', 'core', 'assets', 'globalTypes.d.luau'],
+        ['core', 'assets', 'globalTypes.d.luau'],
+        ['node_modules', '@6xvl', 'robloxstudio-mcp-core', 'assets', 'globalTypes.d.luau'],
+      ],
+    });
+  }
+
+  async luauCheck(dir: string, opts: { tool?: string; args?: string[]; definitions?: string } = {}) {
+    if (!dir) throw new Error('dir is required for luau_check');
+    if (!fs.existsSync(dir)) throw new Error(`${dir} does not exist. Run source_pull first.`);
+
+    /**
+     * luau-lsp, not luau-analyze, and the difference matters.
+     *
+     * Upstream luau-analyze has no --definitions flag at all -- it answers
+     * "Unrecognized option" -- so it cannot be told what a Roblox Instance is. luau-lsp
+     * takes the definitions and is what every Roblox CI uses. luau-analyze is kept as a
+     * fallback because it is better than nothing, but the caller is told what it costs.
+     */
+    const wanted = opts.tool || 'luau-lsp';
+    const resolved = RobloxStudioTools.findTool(wanted);
+    const bin = resolved || wanted;
+
+    const probe = resolved ? { code: 0, spawnError: undefined } : await ProcessRunner.run(bin, ['--version']);
+    if (!resolved && probe.spawnError !== undefined) {
+      return { content: [{ type: 'text', text: JSON.stringify({
+        success: false,
+        error: `${wanted} was not found on PATH or in the aftman/rokit/cargo/foreman bin folders.`,
+        install: wanted === 'luau-lsp'
+          ? 'Download luau-lsp-win64.zip from github.com/JohnnyMorganz/luau-lsp/releases and put luau-lsp.exe on PATH (or in ~/.aftman/bin).'
+          : `install ${wanted} and re-run`,
+        searched: ['PATH', '~/.aftman/bin', '~/.rokit/bin', '~/.cargo/bin', '~/.foreman/bin'],
+      }) }] };
+    }
+
+    const isLsp = path.basename(bin).toLowerCase().startsWith('luau-lsp');
+    const defs = RobloxStudioTools.findLuauDefinitions(dir, opts.definitions);
+
+    const smap = path.join(dir, SOURCEMAP_NAME);
+    const haveSourcemap = fs.existsSync(smap);
+
+    const args: string[] = [];
+    if (isLsp) args.push('analyze');
+    if (isLsp && defs) args.push(`--definitions=${defs}`);
+    // Without it every require reads as "Unknown require: unsupported path" and no
+    // cross-module type error is reachable at all. See buildSourcemap.
+    if (isLsp && haveSourcemap) args.push(`--sourcemap=${smap}`);
+    if (opts.args && opts.args.length) args.push(...opts.args);
+    args.push(dir);
+
+    const res = await ProcessRunner.run(bin, args, dir);
+    const raw = res.combined;
+    // luau-lsp prefixes progress with [INFO]/[WARN]; those are not findings and
+    // counting them as diagnostics would report a clean tree as failing.
+    // Windows tools end lines with CRLF; splitting on the newline alone leaves a
+    // trailing carriage return on every diagnostic, which then rides into the JSON
+    // the caller reads and shows up as a stray escape in every message.
+    const lines = raw
+      ? raw.split(/\r?\n/)
+          .filter(l => l.trim() && !/^\s*(\[INFO\]|\[WARN\]|WARNING:)/.test(l))
+      : [];
+
+    return { content: [{ type: 'text', text: JSON.stringify({
+      success: res.code === 0,
+      tool: bin,
+      definitions: defs,
+      sourcemap: haveSourcemap ? smap : null,
+      warning: (isLsp && !haveSourcemap)
+        ? 'No sourcemap.json here, so requires cannot be resolved: every require reports "unsupported path" and no cross-module type error can be found. Re-run source_pull to generate one.'
+        : (isLsp && !defs)
+        ? 'No Roblox type definitions found, so every Roblox global reads as an unknown-global error. Results are mostly noise until globalTypes.d.luau is supplied.'
+        : (!isLsp
+          ? 'luau-analyze cannot load Roblox type definitions, so Roblox globals are reported as errors. Use luau-lsp for a meaningful result.'
+          : undefined),
+      exitCode: res.code,
+      diagnostics: lines.length,
+      output: lines.slice(0, 200),
+      truncated: lines.length > 200,
+    }) }] };
+  }
+
   async executeLuau(code: string, target?: string) {
     if (!code) {
       throw new Error('Code is required for execute_luau');
@@ -693,7 +1063,18 @@ export class RobloxStudioTools {
   }
 
   async stopPlaytest() {
-    const response = await this.client.request('/api/stop-playtest', {});
+    // EndTest only works inside the play server, so ask that peer directly. A warn from edit
+    // never reached it (probed 2026-09-26), which is why the old signal-only stop did nothing.
+    let endRequested = false;
+    if (this.bridge.getInstances().some((instance) => instance.role === 'server')) {
+      try {
+        const ended = await this.client.request('/api/end-test', {}, 'server');
+        endRequested = ended?.success === true;
+      } catch {
+        // A paused or hung server cannot answer; the edit side reports that below.
+      }
+    }
+    const response = await this.client.request('/api/stop-playtest', { endRequested });
     return {
       content: [
         {
@@ -2433,6 +2814,33 @@ export class RobloxStudioTools {
   /** Breakpoints and logpoints. Registry lives in plugin settings, so it survives a reload. */
   breakpoints(body: any = {}) {
     return this.passthrough('/api/breakpoints', body);
+  }
+
+  /** Snapshot stack and locals at breakpoints/errors in a playtest peer; never holds the pause. */
+  debugger(body: any = {}) {
+    return this.peerRequest('/api/debugger', body.target || 'server', body);
+  }
+
+  /** Open editor tabs: unsaved text, in-editor (undoable or reviewable) edits, Script Analysis diagnostics. */
+  scriptEditor(body: any = {}) {
+    return this.passthrough('/api/script-editor', body);
+  }
+
+  /** Team Create presence plus a log of recent undo/redo/edit activity in the edit session. */
+  studioActivity(body: any = {}) {
+    return this.passthrough('/api/studio-activity', body);
+  }
+
+  /** Push freshly built plugin handler code into the running Studio without a place reopen. */
+  async reloadPlugin() {
+    const outDir = findPluginOutDir();
+    if (!outDir) {
+      throw new Error('Compiled plugin not found (studio-plugin/out/modules). Run npm run build:plugin in the '
+        + 'robloxstudio-mcp-server checkout, or set MCP_PLUGIN_OUT_DIR.');
+    }
+    const { version } = JSON.parse(fs.readFileSync(path.join(outDir, '..', '..', 'package.json'), 'utf8'));
+    const files = readPluginModules(outDir, version);
+    return this.passthrough('/api/reload-plugin', { files });
   }
 
   /**
