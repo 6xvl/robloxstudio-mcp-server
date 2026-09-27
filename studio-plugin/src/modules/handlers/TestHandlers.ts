@@ -1,4 +1,4 @@
-import { HttpService, LogService } from "@rbxts/services";
+import { HttpService, LogService, RunService } from "@rbxts/services";
 
 const StudioTestService = game.GetService("StudioTestService");
 const ServerScriptService = game.GetService("ServerScriptService");
@@ -7,6 +7,7 @@ const ScriptEditorService = game.GetService("ScriptEditorService");
 const STOP_SIGNAL = "__MCP_STOP__";
 const NAV_SIGNAL = "__MCP_NAV__";
 const NAV_RESULT = "__MCP_NAV_RESULT__";
+const STOP_CONFIRM_SECONDS = 5;
 
 interface OutputEntry {
 	message: string;
@@ -188,31 +189,51 @@ function startPlaytest(requestData: Record<string, unknown>) {
 	return { success: true, message: msg };
 }
 
-function stopPlaytest(_requestData: Record<string, unknown>) {
-	if (testRunning) {
-		warn(STOP_SIGNAL);
-		return {
-			success: true,
-			output: [...outputBuffer],
-			outputCount: outputBuffer.size(),
-			message: "Playtest stop signal sent.",
-		};
-	}
+// testRunning flips false only when ExecuteRunModeAsync/ExecutePlayModeAsync returns, so it is
+// the one trustworthy "the test really ended" signal the edit peer has.
+function waitForTestEnd(timeoutSeconds: number): boolean {
+	const deadline = os.clock() + timeoutSeconds;
+	while (testRunning && os.clock() < deadline) task.wait(0.2);
+	return !testRunning;
+}
 
-	const endTest = StudioTestService as unknown as Instance & { EndTest(reason: string): void };
-	const [endOk] = pcall(() => {
-		endTest.EndTest("stopped_by_mcp");
-	});
-	if (endOk) {
-		return {
-			success: true,
-			output: [],
-			outputCount: 0,
-			message: "Playtest stopped via StudioTestService.",
-		};
+// Runs in the play SERVER copy of the plugin: EndTest only works from that DataModel
+// (StudioTestService docs; calling it from edit errors). The MCP server reaches this copy
+// directly over the bridge, the same way eval_server_runtime does.
+function endTest(_requestData: Record<string, unknown>) {
+	if (!RunService.IsRunning() || !RunService.IsServer()) {
+		return { error: "end-test must be sent to the play server peer" };
 	}
+	const service = StudioTestService as unknown as Instance & { EndTest(reason: string): void };
+	const [ok, err] = pcall(() => service.EndTest("stopped_by_mcp"));
+	return ok ? { success: true } : { error: `EndTest failed: ${tostring(err)}` };
+}
 
-	return { error: "No MCP-started test is running and direct stop failed. The playtest may have been started manually." };
+// Runs in the edit copy after the MCP server has asked the play server to end the test.
+// testRunning flips false only when ExecuteRunModeAsync/ExecutePlayModeAsync returns, so it
+// is the edit side's one trustworthy "the test really ended" signal.
+function stopPlaytest(requestData: Record<string, unknown>) {
+	const endRequested = requestData.endRequested === true;
+	const output = [...outputBuffer];
+	if (!testRunning) {
+		// The play server usually finishes EndTest before this runs, so "not running" after an
+		// accepted end request means it stopped, whoever started it.
+		return endRequested
+			? { success: true, stopped: true, output, outputCount: output.size(), message: "Playtest stopped." }
+			: { success: false, stopped: false, output, outputCount: output.size(), error: "No playtest server answered, and none was started by the MCP. Nothing to stop, or press Stop in Studio." };
+	}
+	if (waitForTestEnd(STOP_CONFIRM_SECONDS)) {
+		return { success: true, stopped: true, output, outputCount: output.size(), message: "Playtest stopped." };
+	}
+	return {
+		success: false,
+		stopped: false,
+		output,
+		outputCount: output.size(),
+		error: endRequested
+			? "The play server accepted the stop but the test has not ended yet. Press Stop in Studio if it stays up."
+			: "The play server did not answer the stop. It is likely paused at a breakpoint or hung. Press Stop in Studio.",
+	};
 }
 
 function getPlaytestOutput(_requestData: Record<string, unknown>) {
@@ -274,6 +295,7 @@ function characterNavigation(requestData: Record<string, unknown>) {
 export = {
 	startPlaytest,
 	stopPlaytest,
+	endTest,
 	getPlaytestOutput,
 	characterNavigation,
 };

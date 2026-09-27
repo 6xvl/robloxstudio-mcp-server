@@ -126,7 +126,54 @@ export class BridgeService {
     }
   }
 
+  /**
+   * Which instances could answer a request aimed at `target`, with no pin and no
+   * preference set. More than one means the answer is a coin flip.
+   */
+  candidatesFor(target: string): PluginInstance[] {
+    // getInstances(), not the private map: the proxy subclass keeps its own list and
+    // this check has to see the same Studios the caller sees in list_studios.
+    return this.getInstances().filter(i => i.role === target);
+  }
+
+  // Pinning by role is the same coin flip the request guard stops: every Studio in edit
+  // mode registers as role 'edit', so a find() on the role returned an arbitrary one and
+  // reported success while the session sat pinned to the wrong game.
+  resolveTarget(target: string): { match: PluginInstance } | { error: string; candidates: PluginInstance[] } {
+    const instances = this.getInstances();
+    const byId = instances.find(i => i.instanceId === target);
+    if (byId) return { match: byId };
+    const byRole = instances.filter(i => i.role === target);
+    if (byRole.length === 1) return { match: byRole[0] };
+    if (byRole.length === 0) {
+      return { error: `Studio '${target}' not found`, candidates: instances };
+    }
+    return {
+      error: `${byRole.length} Studios are connected as "${target}", so pinning by role would `
+        + `pick an arbitrary one. Pass the instanceId instead.`,
+      candidates: byRole,
+    };
+  }
+
+  // Two places open and nothing chosen means a read reports the wrong place's tree and a
+  // write lands in it. Called from both transports: ProxyBridgeService overrides
+  // sendRequest entirely, so a guard only in the base class is bypassed by every second
+  // client, which is the normal case.
+  protected assertUnambiguousTarget(target: string, targetInstanceId?: string): void {
+    if (targetInstanceId || this.getPreferredInstance()) return;
+    const candidates = this.candidatesFor(target);
+    if (candidates.length <= 1) return;
+    const list = candidates.map(i => `${i.role} (${i.instanceId})`).join(', ');
+    throw new Error(
+      `${candidates.length} Studios are connected as "${target}" and none is selected, so this `
+      + `request would go to an arbitrary one. Pick one with set_active_studio first. `
+      + `Candidates: ${list}`
+    );
+  }
+
   async sendRequest(endpoint: string, data: any, target = 'edit', targetInstanceId?: string): Promise<any> {
+    this.assertUnambiguousTarget(target, targetInstanceId);
+
     const requestId = uuidv4();
 
     return new Promise((resolve, reject) => {

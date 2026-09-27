@@ -13,6 +13,7 @@ import { BridgeService } from './bridge-service.js';
 import { ProxyBridgeService } from './proxy-bridge-service.js';
 import type { ToolDefinition } from './tools/definitions.js';
 import { RobloxOfficialMCPClient } from './roblox-mcp-client.js';
+import { ToolRegistry } from './managers/tool-registry.js';
 
 export interface ServerConfig {
   name: string;
@@ -30,6 +31,8 @@ export class RobloxStudioMCPServer {
   private mergedTools: ToolDefinition[] = [];
   // Per-Claude active-studio map (keyed by MCP session id when available; otherwise '_default')
   private activeStudioByClient: Map<string, string> = new Map();
+  // The one owner of the tool layer: instance, handlers and definitions move together.
+  private registry!: ToolRegistry;
 
   constructor(config: ServerConfig) {
     this.config = config;
@@ -53,19 +56,31 @@ export class RobloxStudioMCPServer {
       },
       {
         capabilities: {
-          tools: {},
+          // listChanged, or a client caches the tool list for the life of the process
+          // and a hot-reloaded tool is invisible until it reconnects -- which is the
+          // restart this exists to remove.
+          tools: { listChanged: true },
         },
       }
     );
 
     this.bridge = new BridgeService();
     this.tools = new RobloxStudioTools(this.bridge);
+    // A supplier, so a later primary/proxy swap is seen by every reload.
+    this.registry = new ToolRegistry(() => this.bridge, {
+      tools: this.tools,
+      handlers: TOOL_HANDLERS,
+      definitions: config.tools,
+    });
     this.setupToolHandlers();
   }
 
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const ours = this.config.tools.map(t => ({
+      // THE REGISTRY, NOT config.tools. config.tools is frozen at construction, so a
+      // hot-reloaded tool would never appear in the list however many notifications
+      // were sent -- the list would simply be regenerated from the old array.
+      const ours = this.registry.definitions.map(t => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
@@ -120,15 +135,15 @@ export class RobloxStudioMCPServer {
       if (name === 'set_active_studio') {
         const target = (args as any)?.target;
         if (!target) throw new McpError(ErrorCode.InvalidParams, 'target is required');
-        const instances = this.bridge.getInstances();
-        const match = instances.find(i => i.instanceId === target || i.role === target);
-        if (!match) {
+        const resolved = this.bridge.resolveTarget(target);
+        if ('error' in resolved) {
           return { content: [{ type: 'text', text: JSON.stringify({
             success: false,
-            error: `Studio '${target}' not found`,
-            availableStudios: instances.map(i => ({ instanceId: i.instanceId, role: i.role })),
+            error: resolved.error,
+            availableStudios: resolved.candidates.map(i => ({ instanceId: i.instanceId, role: i.role })),
           }) }] };
         }
+        const match = resolved.match;
         this.activeStudioByClient.set('_default', match.role);
         // Bind the INSTANCE, not just the role -- see the twin in http-server.ts.
         this.bridge.setPreferredInstance(match.instanceId);
@@ -136,17 +151,17 @@ export class RobloxStudioMCPServer {
       }
 
       // 3. Our own tools
-      if (!this.allowedToolNames.has(name)) {
+      if (!this.allowedToolNames.has(name) && !this.registry.has(name)) {
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
 
-      const handler = TOOL_HANDLERS[name];
+      const handler = this.registry.handler(name);
       if (!handler) {
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
 
       try {
-        return await handler(this.tools, args ?? {});
+        return await handler(this.registry.tools, args ?? {});
       } catch (error) {
         if (error instanceof McpError) throw error;
         throw new McpError(
@@ -241,6 +256,9 @@ export class RobloxStudioMCPServer {
       const proxyBridge = new ProxyBridgeService(`http://localhost:${basePort}`);
       this.bridge = proxyBridge;
       this.tools = new RobloxStudioTools(this.bridge);
+      // The registry hands this instance to every handler, so a swap it does not see
+      // leaves each tool call talking to the abandoned bridge.
+      this.registry.setTools(this.tools);
       console.error(`Entering proxy mode — forwarding to the primary on localhost:${basePort}. Several MCP clients can share one Studio this way; this one owns no port of its own.`);
 
       // Periodically try to promote to primary if the port frees up
@@ -248,14 +266,22 @@ export class RobloxStudioMCPServer {
       // in >60s AND mcpServerActive=true, force-demote primary and bind here.
       const promotionIntervalMs = parseInt(process.env.ROBLOX_STUDIO_PROXY_PROMOTION_INTERVAL_MS || '5000');
       promotionInterval = setInterval(async () => {
+        // Build the candidate primary WITHOUT touching this.bridge. A failed attempt used
+        // to leave a fresh ProxyBridgeService behind, and each one started a 2s /instances
+        // poller that nobody ever cleared -- one permanent poller per failed attempt.
+        const candidateBridge = new BridgeService();
+        const candidateTools = new RobloxStudioTools(candidateBridge);
+        const candidateApp = createHttpServer(candidateTools, candidateBridge, this.allowedToolNames, buildHttpConfig());
         try {
-          this.bridge = new BridgeService();
-          this.tools = new RobloxStudioTools(this.bridge);
-          primaryApp = createHttpServer(this.tools, this.bridge, this.allowedToolNames, buildHttpConfig());
           // THE BASE PORT ONLY. Promotion exists to take over the port the plugin is
           // actually attached to; landing on any other one would make this a primary
           // with no Studio, which is the failure the initial bind above avoids.
-          const result = await listenWithRetry(primaryApp, host, basePort, 1);
+          const result = await listenWithRetry(candidateApp, host, basePort, 1);
+          proxyBridge.dispose();
+          this.bridge = candidateBridge;
+          this.tools = candidateTools;
+          this.registry.setTools(candidateTools);
+          primaryApp = candidateApp;
           httpHandle = result.server;
           boundPort = result.port;
           bridgeMode = 'primary';
@@ -263,10 +289,7 @@ export class RobloxStudioMCPServer {
           console.error(`Promoted from proxy to primary on port ${boundPort}`);
           if (promotionInterval) clearInterval(promotionInterval);
         } catch {
-          // Still can't bind — stay in proxy mode, restore proxy bridge
-          this.bridge = new ProxyBridgeService(`http://localhost:${basePort}`);
-          this.tools = new RobloxStudioTools(this.bridge);
-          primaryApp = undefined;
+          // Still can't bind — the existing proxy bridge stays in place, untouched.
         }
       }, promotionIntervalMs);
     }
@@ -323,6 +346,31 @@ export class RobloxStudioMCPServer {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error(`${this.config.name} v${this.config.version} running on stdio`);
+
+    // Hot reload, after connect so the notification has somewhere to go. Off for an
+    // installed copy: watch() returns false with no rebuildable core dist nearby.
+    // MCP_HOT_RELOAD=0 switches it off in a source checkout. The notification matters as
+    // much as the swap -- a client caches the tool list for the connection, so a reloaded
+    // tool described by the old schema fails on an argument the caller was told to send.
+    if (process.env.MCP_HOT_RELOAD !== '0') {
+      const watching = this.registry.watch((result) => {
+        if (!result.ok) {
+          // The previous generation is still serving. Named, because a reload that
+          // failed quietly looks exactly like one that worked and changed nothing.
+          console.error(`[hot-reload] kept generation ${result.generation}: ${result.error}`);
+          return;
+        }
+        this.allowedToolNames = new Set(this.registry.definitions.map(t => t.name));
+        this.mergedTools = [...this.registry.definitions];
+        console.error(`[hot-reload] generation ${result.generation}, ${result.tools} tools`);
+        this.server.sendToolListChanged().catch((err) => {
+          console.error(`[hot-reload] tool list notification failed: ${err?.message ?? err}`);
+        });
+      });
+      if (watching) {
+        console.error('[hot-reload] watching the core dist; rebuild and tools swap in place');
+      }
+    }
 
     if (primaryApp) {
       (primaryApp as any).setMCPServerActive(true);

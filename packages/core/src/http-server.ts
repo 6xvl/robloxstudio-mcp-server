@@ -25,6 +25,16 @@ interface StreamableHttpConfig {
 export type ToolHandler = (tools: RobloxStudioTools, body: any) => Promise<any>;
 
 export const TOOL_HANDLERS: Record<string, ToolHandler> = {
+  source_pull: (tools, body) => tools.sourcePull(body.out_dir, {
+    roots: body.roots, exclude: body.exclude, batchSize: body.batch_size, dryRun: body.dry_run,
+  }),
+  source_push: (tools, body) => tools.sourcePush(body.in_dir, {
+    dryRun: body.dry_run, only: body.only,
+  }),
+  source_snapshot: (tools, body) => tools.sourceSnapshot(body.dir, {
+    message: body.message, roots: body.roots, exclude: body.exclude,
+  }),
+  luau_check: (tools, body) => tools.luauCheck(body.dir, { tool: body.tool, args: body.args, definitions: body.definitions }),
   get_file_tree: (tools, body) => tools.getFileTree(body.path),
   search_files: (tools, body) => tools.searchFiles(body.query, body.searchType),
   get_place_info: (tools) => tools.getPlaceInfo(),
@@ -89,7 +99,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   preview_asset: (tools, body) => tools.previewAsset(body.assetId, body.includeProperties, body.maxDepth),
   upload_asset: (tools, body) => tools.uploadAsset(body.filePath, body.assetType, body.displayName, body.description, body.userId, body.groupId),
   place_check: (tools, body) => tools.placeCheck(body.universeId, body.placeId, body.scriptPaths),
-  place_publish: (tools, body) => tools.placePublish(body.universeId, body.placeId, body.scriptPaths, body.restartServers),
+  place_publish: (tools, body) => tools.placePublish(body.universeId, body.placeId, body.scriptPaths, body.restartServers, body.allowShrink),
   clone_object: (tools, body) => tools.cloneObject(body.instancePath, body.targetParentPath),
   get_descendants: (tools, body) => tools.getDescendants(body.instancePath, body.maxDepth, body.classFilter),
   compare_instances: (tools, body) => tools.compareInstances(body.instancePathA, body.instancePathB),
@@ -180,6 +190,10 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   get_memory_breakdown: (tools, body) => tools.getMemoryBreakdown(body),
   get_scene_analysis: (tools, body) => tools.getSceneAnalysis(body),
   breakpoints: (tools, body) => tools.breakpoints(body),
+  debugger: (tools, body) => tools.debugger(body),
+  script_editor: (tools, body) => tools.scriptEditor(body),
+  studio_activity: (tools, body) => tools.studioActivity(body),
+  reload_plugin: (tools) => tools.reloadPlugin(),
   selection: (tools, body) => tools.selection(body.action, body),
   export_rbxm: (tools, body) => tools.exportRbxm(body.instance_paths, body.output_path, body.target),
   import_rbxm: (tools, body) => tools.importRbxm(body.source, body.parent_path, body.target),
@@ -455,15 +469,15 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
           if (name === 'set_active_studio') {
             const target = (args as any)?.target;
             if (!target) throw new McpError(ErrorCode.InvalidParams, 'target is required');
-            const instances = bridge.getInstances();
-            const match = instances.find(i => i.instanceId === target || i.role === target);
-            if (!match) {
+            const resolved = bridge.resolveTarget(target);
+            if ('error' in resolved) {
               return { content: [{ type: 'text', text: JSON.stringify({
                 success: false,
-                error: `Studio '${target}' not found`,
-                availableStudios: instances.map(i => ({ instanceId: i.instanceId, role: i.role })),
+                error: resolved.error,
+                availableStudios: resolved.candidates.map(i => ({ instanceId: i.instanceId, role: i.role })),
               }) }] };
             }
+            const match = resolved.match;
             serverConfig.activeStudioMap?.set(sessionId, match.role);
             // Bind the INSTANCE, not just the role. Tools call through with the default
             // target 'edit', so storing a role alone changed nothing when two places
@@ -596,6 +610,10 @@ function bindPort(app: express.Express, host: string, port: number): Promise<htt
     const server = http.createServer(app);
     const onError = (err: NodeJS.ErrnoException) => {
       server.removeListener('error', onError);
+      // A failed listen still holds its socket until closed. A proxy retries promotion
+      // every 5s, so without this it leaked one socket per try: 2,032 on one process,
+      // which ran Windows out of ephemeral ports ("No buffer space available").
+      server.close();
       reject(err);
     };
     server.once('error', onError);

@@ -1,4 +1,5 @@
 import Utils from "../Utils";
+import DebuggerHandlers from "./DebuggerHandlers";
 
 const { getInstanceByPath } = Utils;
 
@@ -284,11 +285,18 @@ function setBreakpoint(requestData: Record<string, unknown>): unknown {
 
 	const rawLogMessage = typeIs(requestData.log_message, "string") ? requestData.log_message as string : undefined;
 	const hasLogMessage = rawLogMessage !== undefined && rawLogMessage !== "";
-	const continueExecution = typeIs(requestData.continue_execution, "boolean")
-		? requestData.continue_execution as boolean
-		: hasLogMessage;
+	// A pause freezes the whole DataModel, this plugin included, so nothing on the MCP side
+	// can resume it. Pausing is only allowed when this peer's debugger will resume at once.
+	const continueExecution = requestData.continue_execution !== false;
+	if (!continueExecution && !DebuggerHandlers.isAttached()) {
+		return {
+			error: "pause_without_resumer",
+			message: "continue_execution=false would freeze the game, Studio scripts and MCP until someone presses Resume. "
+				+ "Run debugger action=attach on the same target first, or drop continue_execution for a logpoint.",
+		};
+	}
 	const enabled = typeIs(requestData.enabled, "boolean") ? requestData.enabled as boolean : true;
-	const effectiveLogMessage = hasLogMessage || continueExecution ? buildLogMessage(scriptPath, requestedLine, rawLogMessage) : undefined;
+	const effectiveLogMessage = continueExecution ? buildLogMessage(scriptPath, requestedLine, rawLogMessage) : undefined;
 
 	const spec: ScriptBreakpointSpec = {
 		Line: requestedLine,

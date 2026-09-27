@@ -15,6 +15,22 @@ export class ProxyBridgeService extends BridgeService {
     // unref so a proxy that is otherwise idle does not hold the process open.
     const timer = setInterval(() => void this.refreshInstances(), 2000);
     if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    this.refreshTimer = timer;
+  }
+
+  private refreshTimer: ReturnType<typeof setInterval> | undefined;
+
+  /**
+   * Stop polling. Without this, replacing a proxy bridge orphans its interval: the object
+   * is dropped but the timer keeps fetching /instances forever. A promotion retry loop
+   * that rebuilt the bridge every 5s stacked one permanent poller per attempt and
+   * exhausted the machine's ephemeral ports.
+   */
+  dispose(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
   }
 
   /**
@@ -59,6 +75,10 @@ export class ProxyBridgeService extends BridgeService {
   private preferred: string | null = null;
 
   override async sendRequest(endpoint: string, data: any, target = 'edit', targetInstanceId?: string): Promise<any> {
+    // Before the request leaves this process. The primary cannot make this call for us:
+    // it sees one merged queue and cannot tell an unchosen client from a chosen one.
+    this.assertUnambiguousTarget(target, targetInstanceId);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.proxyRequestTimeout);
 

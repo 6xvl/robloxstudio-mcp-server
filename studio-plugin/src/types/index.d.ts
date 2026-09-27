@@ -3,6 +3,7 @@
 export interface Connection {
 	port: number;
 	serverUrl: string;
+	loggedPollFailure?: boolean;
 	isActive: boolean;
 	pollInterval: number;
 	lastPoll: number;

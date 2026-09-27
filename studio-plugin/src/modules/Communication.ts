@@ -22,6 +22,9 @@ import MicroProfilerHandlers from "./handlers/MicroProfilerHandlers";
 import MemoryHandlers from "./handlers/MemoryHandlers";
 import SceneAnalysisHandlers from "./handlers/SceneAnalysisHandlers";
 import BreakpointHandlers from "./handlers/BreakpointHandlers";
+import DebuggerHandlers from "./handlers/DebuggerHandlers";
+import EditorHandlers from "./handlers/EditorHandlers";
+import ReloadHandlers from "./handlers/ReloadHandlers";
 import MultiplayerTestHandlers from "./handlers/MultiplayerTestHandlers";
 import { Connection, RequestPayload, PollResponse, ReadyResponse } from "../types";
 
@@ -29,7 +32,8 @@ const instanceId = HttpService.GenerateGUID(false);
 let assignedRole: string | undefined;
 
 function detectRole(): string {
-	if (!RunService.IsRunMode()) return "edit";
+	// IsRunMode is true only for a Run playtest, so Play-mode peers used to report as edit.
+	if (!RunService.IsRunning()) return "edit";
 	if (RunService.IsServer()) return "server";
 	return "client";
 }
@@ -95,6 +99,9 @@ const routeMap: Record<string, Handler> = {
 	"/api/get-memory-breakdown": MemoryHandlers.getMemoryBreakdown,
 	"/api/get-scene-analysis": SceneAnalysisHandlers.getSceneAnalysis,
 	"/api/breakpoints": BreakpointHandlers.breakpoints,
+	"/api/debugger": DebuggerHandlers.debuggerAction,
+	"/api/script-editor": EditorHandlers.scriptEditor,
+	"/api/studio-activity": EditorHandlers.studioActivity,
 	"/api/multiplayer-test-start": MultiplayerTestHandlers.multiplayerTestStart,
 	"/api/multiplayer-test-state": MultiplayerTestHandlers.multiplayerTestState,
 	"/api/multiplayer-test-add-players": MultiplayerTestHandlers.multiplayerTestAddPlayers,
@@ -106,6 +113,7 @@ const routeMap: Record<string, Handler> = {
 
 	"/api/start-playtest": TestHandlers.startPlaytest,
 	"/api/stop-playtest": TestHandlers.stopPlaytest,
+	"/api/end-test": TestHandlers.endTest,
 	"/api/get-playtest-output": TestHandlers.getPlaytestOutput,
 	"/api/character-navigation": TestHandlers.characterNavigation,
 
@@ -124,11 +132,23 @@ const routeMap: Record<string, Handler> = {
 	"/api/find-and-replace-in-scripts": ScriptHandlers.findAndReplaceInScripts,
 };
 
+// Set by a hot reload: requests go to the freshly loaded handlers instead of this module's.
+let routeOverride: Record<string, Handler> | undefined;
+
+function setRouteOverride(routes: Record<string, Handler>) {
+	routeOverride = routes;
+}
+
 function processRequest(request: RequestPayload): unknown {
 	const endpoint = request.endpoint;
 	const data = request.data ?? {};
 
-	const handler = routeMap[endpoint];
+	// Always served by this (the live poll loop's) copy, so every reload swaps the routes this
+	// loop actually uses, not those of a previously reloaded copy.
+	if (endpoint === "/api/reload-plugin") {
+		return ReloadHandlers.reloadPlugin(data as Record<string, unknown>, setRouteOverride);
+	}
+	const handler = (routeOverride ?? routeMap)[endpoint];
 	if (handler) {
 		return handler(data as Record<string, unknown>);
 	} else {
@@ -237,6 +257,13 @@ function pollForRequests(connIndex: number) {
 			});
 		}
 	} else if (conn.isActive) {
+		// Once per connection: without this a peer that can never reach the MCP (seen with the
+		// Play-mode client copy) just shows "connecting" forever with no reason anywhere.
+		if (!conn.loggedPollFailure) {
+			conn.loggedPollFailure = true;
+			const reason = success ? `HTTP ${result.StatusCode} ${result.StatusMessage}` : tostring(result);
+			warn(`[MCP] ${detectRole()} peer cannot reach ${conn.serverUrl}: ${reason}`);
+		}
 		conn.consecutiveFailures++;
 
 		if (conn.consecutiveFailures > 1) {
@@ -421,6 +448,7 @@ function checkForUpdates() {
 }
 
 export = {
+	routes: routeMap,
 	getConnectionStatus,
 	activatePlugin,
 	deactivatePlugin,

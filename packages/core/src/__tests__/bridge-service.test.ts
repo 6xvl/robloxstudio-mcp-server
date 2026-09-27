@@ -143,6 +143,10 @@ describe('BridgeService', () => {
     it('hands a request to only one of two instances on the same role', () => {
       bridgeService.registerInstance('studio-a', 'edit');
       bridgeService.registerInstance('studio-b', 'edit');
+      // A preference is required now: sendRequest refuses an unresolved role rather
+      // than picking one (see the ambiguous target guard). Claiming is still what
+      // stops the CHOSEN instance's request reaching the other one as well.
+      bridgeService.setPreferredInstance('studio-a');
       bridgeService.sendRequest('/api/edit', { script: 'A' });
 
       const toA = bridgeService.getPendingRequest('edit', 'studio-a');
@@ -229,6 +233,12 @@ describe('BridgeService', () => {
     it('releases the claim when the holder disconnects', () => {
       bridgeService.registerInstance('studio-a', 'edit');
       bridgeService.registerInstance('studio-b', 'edit');
+      // A PREFERENCE, not a per-request pin. An unresolved role is refused outright
+      // now, so the request needs one or the other -- but a pin names studio-a
+      // permanently and would correctly refuse studio-b even after studio-a dropped,
+      // which is the opposite of what this test is about. unregisterInstance clears a
+      // preference when its holder goes, so the claim can move.
+      bridgeService.setPreferredInstance('studio-a');
       bridgeService.sendRequest('/api/edit', { script: 'A' });
 
       const toA = bridgeService.getPendingRequest('edit', 'studio-a');
@@ -241,5 +251,95 @@ describe('BridgeService', () => {
       const toB = bridgeService.getPendingRequest('edit', 'studio-b');
       expect(toB?.requestId).toBe(toA!.requestId);
     });
+  });
+});
+describe('ambiguous target guard', () => {
+  it('refuses when two Studios share a role and none is selected', async () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('aaa', 'edit');
+    bridge.registerInstance('bbb', 'edit');
+
+    await expect(bridge.sendRequest('/test', {}, 'edit')).rejects.toThrow(
+      /2 Studios are connected as "edit" and none is selected/
+    );
+  });
+
+  it('names the candidates so the caller can pick one', async () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('aaa', 'edit');
+    bridge.registerInstance('bbb', 'edit');
+
+    await expect(bridge.sendRequest('/test', {}, 'edit')).rejects.toThrow(/aaa/);
+    await expect(bridge.sendRequest('/test', {}, 'edit')).rejects.toThrow(/bbb/);
+  });
+
+  it('allows a single Studio through untouched', () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('only', 'edit');
+    // Resolves via the normal queue, so it must still be pending rather than rejected.
+    const p = bridge.sendRequest('/test', {}, 'edit');
+    p.catch(() => {});
+    expect(bridge.getPendingRequestCount()).toBe(1);
+  });
+
+  it('allows an explicit per-request pin even with several connected', () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('aaa', 'edit');
+    bridge.registerInstance('bbb', 'edit');
+    const p = bridge.sendRequest('/test', {}, 'edit', 'bbb');
+    p.catch(() => {});
+    expect(bridge.getPendingRequestCount()).toBe(1);
+  });
+
+  describe('resolveTarget', () => {
+    const withInstances = (...pairs: [string, string][]) => {
+      const bridge = new BridgeService();
+      for (const [id, role] of pairs) bridge.registerInstance(id, role);
+      return bridge;
+    };
+
+    it('pins by instance id even when the role is shared', () => {
+      const res = withInstances(['a', 'edit'], ['b', 'edit']).resolveTarget('b') as any;
+      expect(res.match.instanceId).toBe('b');
+    });
+
+    it('pins by role when exactly one Studio holds it', () => {
+      const res = withInstances(['a', 'edit']).resolveTarget('edit') as any;
+      expect(res.match.instanceId).toBe('a');
+    });
+
+    it('REFUSES a role two Studios share instead of picking the first', () => {
+      // The observed bug: asked for one instance, got a different one, success: true --
+      // and the session then edited the wrong game while looking correctly pinned.
+      const res = withInstances(['a', 'edit'], ['b', 'edit']).resolveTarget('edit') as any;
+      expect(res.match).toBeUndefined();
+      expect(res.error).toContain('2 Studios');
+      expect(res.candidates.map((i: any) => i.instanceId).sort()).toEqual(['a', 'b']);
+    });
+
+    it('reports not-found with everything that IS connected', () => {
+      const res = withInstances(['a', 'edit']).resolveTarget('nope') as any;
+      expect(res.error).toContain('not found');
+      expect(res.candidates).toHaveLength(1);
+    });
+  });
+
+  it('allows a server-wide preference from set_active_studio', () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('aaa', 'edit');
+    bridge.registerInstance('bbb', 'edit');
+    bridge.setPreferredInstance('aaa');
+    const p = bridge.sendRequest('/test', {}, 'edit');
+    p.catch(() => {});
+    expect(bridge.getPendingRequestCount()).toBe(1);
+  });
+
+  it('does not fire for different roles', () => {
+    const bridge = new BridgeService();
+    bridge.registerInstance('aaa', 'edit');
+    bridge.registerInstance('bbb', 'server');
+    const p = bridge.sendRequest('/test', {}, 'edit');
+    p.catch(() => {});
+    expect(bridge.getPendingRequestCount()).toBe(1);
   });
 });
