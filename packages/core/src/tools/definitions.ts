@@ -2886,7 +2886,7 @@ part(0,2,0,2,1,1,"b")`,
         },
         continue_execution: {
           type: 'boolean',
-          description: 'Continue after hit; defaults true; false needs a resumer.'
+          description: 'Defaults true (logpoint). false pauses, and is refused unless debugger attach ran on the same target.'
         },
         target: {
           type: 'string',

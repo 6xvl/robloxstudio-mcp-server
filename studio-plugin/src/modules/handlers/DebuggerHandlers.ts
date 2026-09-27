@@ -23,6 +23,7 @@ const BREAK_MODES = ["Never", "Always", "Unhandled"];
 const debuggerService = game.GetService("ScriptDebuggerService" as keyof Services) as unknown as DebuggerLike;
 
 let attached = false;
+let exceptionModeSet = false;
 let watchExpressions: string[] = [];
 let includeGlobals = false;
 let snapshotCount = 0;
@@ -102,6 +103,11 @@ function debuggerAction(requestData: Record<string, unknown>) {
 	if (action === "detach") {
 		debuggerService.OnStopped = undefined;
 		attached = false;
+		// Left armed, the next error pauses the game with no callback to resume it.
+		if (exceptionModeSet) {
+			pcall(() => debuggerService.SetExceptionBreakMode(Enums.DebugBreakModeType.Never));
+			exceptionModeSet = false;
+		}
 		return { success: true, message: "Detached; Studio's own debugger handles pauses again." };
 	}
 	if (action === "snapshots") {
@@ -121,10 +127,14 @@ function debuggerAction(requestData: Record<string, unknown>) {
 	if (action === "exception_mode") {
 		const mode = requestData.mode as string;
 		if (!BREAK_MODES.includes(mode)) return { error: `mode must be one of ${BREAK_MODES.join(", ")}` };
+		if (mode !== "Never" && !attached) {
+			return { error: "Attach first: breaking on errors with nothing to resume freezes the game and MCP." };
+		}
 		debuggerService.SetExceptionBreakMode(Enums.DebugBreakModeType[mode]);
+		exceptionModeSet = mode !== "Never";
 		return { success: true, mode };
 	}
 	return { error: `Unknown action: ${action}` };
 }
 
-export = { debuggerAction };
+export = { debuggerAction, isAttached: () => attached };
